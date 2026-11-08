@@ -32,7 +32,7 @@
     "description": "每天自动在青蛙（qingwapt.com）蝌蚪商店购买「每日福利：1000蝌蚪」，复用站点已配置的 Cookie 与代理，重复购买自动识别为今日已领。",
     "labels": "站点,福利,签到",
     "version": "1.0",
-    "icon": "signin.png",
+    "icon": "",
     "author": "hermes",
     "level": 2,
     "release": false,
