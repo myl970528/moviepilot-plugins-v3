@@ -20,7 +20,16 @@ https://github.com/<owner>/moviepilot-plugins-v3
 
 把 `<owner>` 换成仓库实际所属账号，然后搜索插件名安装。
 
-`package.v3.json` 是市场索引，`plugins.v3/<插件ID>/` 是插件本体。
+`package.v3.json` 是市场索引，`plugins.v3/<插件ID小写>/` 是插件本体。
+
+> 目录名必须是**插件 ID 的小写**（`Piggo` → `plugins.v3/piggo/`）。写成大写时 MoviePilot
+> 会报「插件源码目录不存在」，索引本身却能正常解析，很容易误判。
+
+CustomSiteData 装好是空的，要在插件设置里填 `域名=解析器`，一行一个：
+
+```
+naxx.xxx=NexusPhp
+```
 
 > 国内网络直连 `raw.githubusercontent.com` 经常不通。如果在插件市场里拉不到索引，在
 > MoviePilot 的「设置 - 系统 - GITHUB_PROXY」里填一个 GitHub 加速前缀（例如 `https://gh-proxy.com`），
@@ -51,3 +60,17 @@ docker restart moviepilot-v3
 - 代码里不含任何站点凭据、代理地址或主机路径，全部通过插件配置、站点配置或环境变量传入。
 - 依赖站点私有接口，站点改版后可能失效，按需自行维护。
 - 这些接口都是抓包摸出来的，没有官方文档，随时可能变。
+
+## 常见问题
+
+**市场里点安装报「非法插件ID」**
+该插件已经在 `/config/plugins/<id>` 存在，并且 `/app/app/plugins/<id>` 是指向它的软链接（本地插件
+就是这样挂载的）。MoviePilot 安装前做目录快照时会 `resolve()` 这个软链，路径跑到插件根目录之外，
+于是判定 ID 非法。要么先在容器里 `rm /app/app/plugins/<id>` 再装，要么干脆继续用本地插件方式，
+把代码放 `/config/plugins/<id>` 并建软链。
+
+**市场里点安装报「插件源码目录不存在」**
+仓库目录名大小写不对，见上面的说明。
+
+**装完在市场里显示的还是本地版本**
+同名的本地插件优先级更高，列表里 `is_local` 为 true 的那条就是本地目录里的代码。

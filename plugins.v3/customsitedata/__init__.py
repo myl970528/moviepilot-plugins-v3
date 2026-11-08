@@ -28,7 +28,7 @@ _PATCH_FLAG = "_hermes_custom_site_schema_patch"
 _MAPPING: Dict[str, str] = {}
 _ORIGINAL: Optional[Any] = None
 
-_DEFAULT_MAPPING = "ubits.club=NexusPhp\nqingwapt.com=NexusPhp"
+_DEFAULT_MAPPING = ""
 
 
 def _domain_of(value: Any) -> str:
