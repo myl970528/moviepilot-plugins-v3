@@ -17,13 +17,14 @@
     "name": "自定义站点数据",
     "description": "给手工添加的自定义站点按域名注入用户数据解析器 schema，修复站点管理里点「更新数据」报 schema：None、取不到上传下载与分享率的问题。",
     "labels": "站点,工具",
-    "version": "1.0",
+    "version": "1.1",
     "icon": "",
     "author": "hermes",
     "level": 2,
     "release": false,
     "system_version": ">=3.0.0",
     "history": {
+      "v1.1": "修重载后补丁失效：映射改挂在 SiteChain 上、每次调用重新读取；原始方法存根在类上，插件升级后新代码立即生效。默认映射留空。",
       "v1.0": "首个发布版本：在 SiteChain.refresh_userdata 入口按域名补 schema，未命中的站点原样透传。"
     }
   },

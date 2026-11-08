@@ -24,7 +24,11 @@ from app.plugins import _PluginBase
 
 # 已经打过补丁的标记，避免插件重载时重复包装
 _PATCH_FLAG = "_hermes_custom_site_schema_patch"
-# 运行时生效的 域名 -> schema 映射，init_plugin 时重建
+# 生效中的映射挂在 SiteChain 上：包装函数每次调用都重新读，
+# 这样插件重载/升级后不会读到被清空的旧字典（旧写法是模块级全局，重载后永久失效）
+_MAP_FLAG = "_hermes_custom_site_schema_map"
+# 原始 refresh_userdata 的存根位置，重载后据此重新包装，避免叠加多层
+_ORIG_FLAG = "_hermes_custom_site_original_refresh"
 _MAPPING: Dict[str, str] = {}
 _ORIGINAL: Optional[Any] = None
 
@@ -65,12 +69,21 @@ def _parse_mapping(text: str) -> Dict[str, str]:
     return result
 
 
-def _fill_schema(site: Optional[dict]) -> Optional[dict]:
+def _active_mapping() -> Dict[str, str]:
+    """取当前生效的映射：优先读挂在 SiteChain 上的那份，没有则退回模块内副本。"""
+    from app.chain.site import SiteChain
+
+    current = getattr(SiteChain, _MAP_FLAG, None)
+    return current if isinstance(current, dict) else _MAPPING
+
+
+def _fill_schema(site: Optional[dict], mapping: Optional[Dict[str, str]] = None) -> Optional[dict]:
     """站点没有 schema 且命中映射时，复制一份并补上 schema。"""
     if not isinstance(site, dict) or site.get("schema"):
         return site
+    rules = _active_mapping() if mapping is None else mapping
     domain = _domain_of(site.get("domain") or site.get("url"))
-    schema = _MAPPING.get(domain)
+    schema = rules.get(domain)
     if not schema:
         return site
     patched = dict(site)
@@ -79,14 +92,17 @@ def _fill_schema(site: Optional[dict]) -> Optional[dict]:
 
 
 def _install_patch() -> bool:
-    """把 SiteChain.refresh_userdata 包一层，插件重载时只包一次。"""
-    global _ORIGINAL
+    """把 SiteChain.refresh_userdata 包一层。
+
+    原始方法记在 SiteChain 上，每次重载都重新包一次，这样插件升级后新代码能立刻生效，
+    也不会出现「包了旧的、新的不包」导致补丁失效的情况。
+    """
     from app.chain.site import SiteChain
 
-    if getattr(SiteChain, _PATCH_FLAG, False):
-        return True
-
-    original = SiteChain.refresh_userdata
+    original = getattr(SiteChain, _ORIG_FLAG, None)
+    if original is None:
+        original = SiteChain.refresh_userdata
+        setattr(SiteChain, _ORIG_FLAG, original)
 
     def refresh_userdata(self, site: Optional[dict] = None, *args, **kwargs):
         return original(self, _fill_schema(site), *args, **kwargs)
@@ -95,7 +111,6 @@ def _install_patch() -> bool:
     refresh_userdata.__doc__ = getattr(original, "__doc__", None)
     SiteChain.refresh_userdata = refresh_userdata
     setattr(SiteChain, _PATCH_FLAG, True)
-    _ORIGINAL = original
     return True
 
 
@@ -107,7 +122,7 @@ class CustomSiteData(_PluginBase):
     # 插件图标
     plugin_icon = "signin.png"
     # 插件版本
-    plugin_version = "1.0"
+    plugin_version = "1.1"
     # 插件作者
     plugin_author = "hermes"
     # 作者主页
@@ -136,6 +151,10 @@ class CustomSiteData(_PluginBase):
             _MAPPING.update(_parse_mapping(self._mapping_text))
 
         try:
+            from app.chain.site import SiteChain
+
+            # 先发布映射再装补丁：补丁每次调用都读这份，重载后立刻生效
+            setattr(SiteChain, _MAP_FLAG, dict(_MAPPING))
             _install_patch()
             if self._enabled:
                 logger.info(f"自定义站点数据：已启用，schema 映射 {_MAPPING or '（空）'}")
@@ -164,7 +183,7 @@ class CustomSiteData(_PluginBase):
         data = {
             "enabled": self._enabled,
             "patched": bool(getattr(SiteChain, _PATCH_FLAG, False)),
-            "mapping": dict(_MAPPING),
+            "mapping": dict(_active_mapping()),
         }
         return schemas.Response(success=True, data=data)
 
@@ -234,7 +253,7 @@ class CustomSiteData(_PluginBase):
 
         patched = bool(getattr(SiteChain, _PATCH_FLAG, False))
         rows = []
-        for domain, schema in sorted(_MAPPING.items()):
+        for domain, schema in sorted(_active_mapping().items()):
             rows.append({
                 'component': 'tr',
                 'content': [
@@ -298,3 +317,9 @@ class CustomSiteData(_PluginBase):
     def stop_service(self):
         """停用插件时清空映射，让 refresh_userdata 恢复原样。"""
         _MAPPING.clear()
+        try:
+            from app.chain.site import SiteChain
+
+            setattr(SiteChain, _MAP_FLAG, {})
+        except Exception:
+            pass
