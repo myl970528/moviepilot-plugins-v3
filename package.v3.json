@@ -1,0 +1,44 @@
+{
+  "Piggo": {
+    "name": "猪猪",
+    "description": "猪猪站（piggo.me）一体化插件：注册搜索索引、拉全站建本地索引跨站自动辅种、每日签到（含验证码补交），登录统一走站点自研 SRP-6a。",
+    "labels": "站点,索引,辅种,签到",
+    "version": "2.0",
+    "icon": "",
+    "author": "hermes",
+    "level": 2,
+    "release": false,
+    "system_version": ">=3.0.0",
+    "history": {
+      "v2.0": "首个发布版本：索引搜索、跨站自动辅种（主辅分离 + infohash 判重）、每日签到三合一；兼容 MoviePilot v3。"
+    }
+  },
+  "CustomSiteData": {
+    "name": "自定义站点数据",
+    "description": "给手工添加的自定义站点按域名注入用户数据解析器 schema，修复站点管理里点「更新数据」报 schema：None、取不到上传下载与分享率的问题。",
+    "labels": "站点,工具",
+    "version": "1.0",
+    "icon": "",
+    "author": "hermes",
+    "level": 2,
+    "release": false,
+    "system_version": ">=3.0.0",
+    "history": {
+      "v1.0": "首个发布版本：在 SiteChain.refresh_userdata 入口按域名补 schema，未命中的站点原样透传。"
+    }
+  },
+  "QingwaDaily": {
+    "name": "青蛙每日福利",
+    "description": "每天自动在青蛙（qingwapt.com）蝌蚪商店购买「每日福利：1000蝌蚪」，复用站点已配置的 Cookie 与代理，重复购买自动识别为今日已领。",
+    "labels": "站点,福利,签到",
+    "version": "1.0",
+    "icon": "signin.png",
+    "author": "hermes",
+    "level": 2,
+    "release": false,
+    "system_version": ">=3.0.0",
+    "history": {
+      "v1.0": "首个发布版本：走 /api/bonus-shop/getItems 查商品、/api/bonus-shop/exchange 下单，命中限购视为已领。"
+    }
+  }
+}
