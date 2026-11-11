@@ -1,15 +1,16 @@
 {
   "Piggo": {
     "name": "猪猪",
-    "description": "猪猪站（piggo.me）一体化插件：注册搜索索引、拉全站建本地索引跨站自动辅种、每日签到（含验证码补交），登录统一走站点自研 SRP-6a。",
+    "description": "猪猪站（piggo.me）一体化插件：注册搜索索引、按发布时间增量建本地索引跨站自动辅种（可选实验室 API 令牌 + 站点做种清单判重）、每日签到。",
     "labels": "站点,索引,辅种,签到",
-    "version": "2.0",
+    "version": "2.1",
     "icon": "",
     "author": "hermes",
     "level": 2,
     "release": false,
     "system_version": ">=3.0.0",
     "history": {
+      "v2.1": "索引刷新可选走个人中心实验室 API（Bearer 令牌 + added_at 增量），失败自动回退前台列表；用 /me/torrents?kind=seeding 的站点做种清单加一层判重。两项均可用开关关闭，不配令牌时行为与 2.0 完全一致。",
       "v2.0": "首个发布版本：索引搜索、跨站自动辅种（主辅分离 + infohash 判重）、每日签到三合一；兼容 MoviePilot v3。"
     }
   },

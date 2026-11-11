@@ -10,7 +10,9 @@
   签到：站点把签到做成万年历（/calendar），每日调 /calendar/attendance，
         风控命中时用图片验证码补交。
 
-登录统一走站点自研 SRP-6a，token 失效由各自模块自动重登。
+索引优先走个人中心的实验室 API（Bearer 令牌 + added_at 增量），没配令牌
+或 API 失败时回退前台列表；种子下载与搜索仍走前台 SRP-6a 登录。
+签到依赖 SRP，token 失效由各自模块自动重登。
 """
 from __future__ import annotations
 
@@ -33,6 +35,7 @@ from app.schemas import NotificationType
 
 from .engine import (
     DEFAULT_BASE,
+    PiggoApiClient,
     PiggoClient,
     PiggoError,
     file_signature,
@@ -53,6 +56,7 @@ _INDEX_FILE = "piggo_index.json"
 _SEEDED_KEY = "seed_seeded"
 _SEED_STATS_KEY = "seed_stats"
 _SIGN_STATS_KEY = "sign_stats"
+_API_CURSOR_KEY = "piggo_api_cursor"
 
 
 def _attr(obj: Any, *names: str, default: Any = None) -> Any:
@@ -151,7 +155,7 @@ class Piggo(_PluginBase):
     # 插件图标
     plugin_icon = "spider.png"
     # 插件版本
-    plugin_version = "2.0"
+    plugin_version = "2.1"
     # 插件作者
     plugin_author = "hermes"
     # 作者主页
@@ -172,9 +176,12 @@ class Piggo(_PluginBase):
     _visitorid: str = _DEFAULT_VISITORID
     _site_id: int = 14
     _proxy: str = _DEFAULT_PROXY
+    _api_token: str = ""
 
     # ---- 辅种
     _seed_enabled: bool = False
+    _seed_api_index: bool = True
+    _seed_skip_site_seeding: bool = True
     _seed_cron: str = _DEFAULT_SEED_CRON
     _seed_downloader: str = ""
     _seed_source_downloader: str = ""
@@ -207,6 +214,7 @@ class Piggo(_PluginBase):
             self._token = str(config.get("token") or "").strip()
             self._username = str(config.get("username") or "").strip()
             self._password = str(config.get("password") or "").strip()
+            self._api_token = str(config.get("api_token") or "").strip()
             domain = str(config.get("domain") or "").strip().lower()
             if domain:
                 self._domain = domain
@@ -224,6 +232,10 @@ class Piggo(_PluginBase):
                 pass
 
             self._seed_enabled = bool(config.get("seed_enabled"))
+            self._seed_api_index = bool(config.get("seed_api_index", True))
+            self._seed_skip_site_seeding = bool(
+                config.get("seed_skip_site_seeding", True)
+            )
             self._seed_cron = str(config.get("seed_cron") or _DEFAULT_SEED_CRON).strip()
             self._seed_downloader = str(config.get("seed_downloader") or "").strip()
             self._seed_source_downloader = self.__join_names(
@@ -376,7 +388,9 @@ class Piggo(_PluginBase):
                     self.__section(
                         "站点与索引",
                         "账号密码用于自动登录，token 留空即可（插件自动获取并续期）。"
-                        "开启索引后，站点管理里的猪猪站可搜索与下载。",
+                        "实验室 API 令牌用于免登录态增量刷新辅种索引，等同账号密码，"
+                        "留空则索引继续走前台列表。开启索引后，站点管理里的"
+                        "猪猪站可搜索与下载。",
                     ),
                     {
                         "component": "VRow",
@@ -401,13 +415,23 @@ class Piggo(_PluginBase):
                                 "token", "token（可留空，自动维护）")),
                         ],
                     },
+                    {
+                        "component": "VRow",
+                        "content": [
+                            self.__col(12, self.__field(
+                                "api_token",
+                                "实验室 API 令牌（个人中心生成，可留空）",
+                                "password")),
+                        ],
+                    },
 
                     self.__section(
                         "自动辅种",
                         "主辅分离：主下载器只负责提供「本地已完成种子」清单，"
                         "辅种下载器只负责新增辅种，两台各管一头。"
                         "按总字节数相等 + 文件清单完全一致跨站匹配，校验满 100% 才开始做种。"
-                        "索引页数填 0 表示拉全站（约 3-5 分钟）。",
+                        "配置实验室 API 令牌后，索引按发布时间增量刷新，并用站点当前做种"
+                        "清单提前判重；索引页数填 0 表示拉满 100 页（约 4 分钟）。",
                     ),
                     {
                         "component": "VRow",
@@ -416,6 +440,16 @@ class Piggo(_PluginBase):
                             self.__col(3, self.__field("seed_cron", "执行周期")),
                             self.__col(3, self.__switch("seed_notify", "辅种通知")),
                             self.__col(3, self.__switch("seed_onlyonce", "立即辅种一次")),
+                        ],
+                    },
+                    {
+                        "component": "VRow",
+                        "content": [
+                            self.__col(6, self.__switch(
+                                "seed_api_index", "用实验室 API 增量刷新索引")),
+                            self.__col(6, self.__switch(
+                                "seed_skip_site_seeding",
+                                "跳过站点已在做种的种子（换辅种机时请关闭）")),
                         ],
                     },
                     {
@@ -505,9 +539,12 @@ class Piggo(_PluginBase):
             "password": self._password,
             "visitorid": self._visitorid,
             "token": self._token,
+            "api_token": self._api_token,
             "site_id": self._site_id,
             "proxy": self._proxy,
             "seed_enabled": self._seed_enabled,
+            "seed_api_index": self._seed_api_index,
+            "seed_skip_site_seeding": self._seed_skip_site_seeding,
             "seed_cron": self._seed_cron,
             "seed_downloader": self._seed_downloader,
             "seed_source_downloader": [
@@ -598,6 +635,16 @@ class Piggo(_PluginBase):
                          f"，耗时 {seed_stats.get('elapsed', 0)} 秒")
             lines.append(f"  索引 {seed_stats.get('index_total', 0)} 条，"
                          f"本地已完成 {seed_stats.get('local_done', 0)} 个")
+            source = str(seed_stats.get("index_source") or "web")
+            lines.append(
+                f"  索引来源：{'实验室 API 增量' if source == 'api' else '前台列表'}，"
+                f"本轮刷新 {seed_stats.get('index_new', 0)} 条"
+            )
+            if seed_stats.get("site_seeding") is not None:
+                lines.append(
+                    f"  站点做种清单 {seed_stats.get('site_seeding', 0)} 个，"
+                    f"据此跳过 {seed_stats.get('site_skipped', 0)} 个"
+                )
             lines.append(f"  体积命中 {seed_stats.get('hit', 0)}，"
                          f"清单一致 {seed_stats.get('matched', 0)}，"
                          f"新增 {seed_stats.get('added', 0)}，"
@@ -793,17 +840,15 @@ class Piggo(_PluginBase):
 
             index = self.__load_index()
             logger.info(f"猪猪辅种：已有索引 {len(index)} 条，开始刷新")
-            fresh = client.build_index(
-                pages=self._seed_pages,
-                on_progress=lambda page, total, count: logger.info(
-                    f"猪猪辅种：索引 {page}/{total}，累计 {count} 条"
-                ),
-            )
+            fresh, source = self.__refresh_index(client, index)
             index.update(fresh)
             self.__save_index(index)
             stats["index_total"] = len(index)
             stats["index_new"] = len(fresh)
-            logger.info(f"猪猪辅种：索引更新完成，共 {len(index)} 条")
+            stats["index_source"] = source
+            logger.info(
+                f"猪猪辅种：索引更新完成（{source}），共 {len(index)} 条"
+            )
 
             target = self.__pick_downloader()
             if not target:
@@ -923,10 +968,11 @@ class Piggo(_PluginBase):
             stats["hit"] = len(hits)
             logger.info(f"猪猪辅种：体积粗筛命中 {len(hits)} 个种子")
 
-            added = skipped = failed = matched = 0
+            added = skipped = failed = matched = site_skipped = 0
             # 同一个猪猪种子只会有一个 infohash，TR 不接受重复添加；
             # 多个本地条目命中同一个站内种子时只加一次。
             added_pig: set = set()
+            site_seeding = self.__site_seeding_ids(stats)
             for torrent, candidates in hits:
                 if added >= self._seed_max_add:
                     stats["message"] = f"达到单轮上限 {self._seed_max_add}，剩余下轮继续"
@@ -938,6 +984,12 @@ class Piggo(_PluginBase):
                 for candidate in candidates:
                     if candidate["id"] in added_pig:
                         skipped += 1
+                        break
+                    if candidate["id"] in site_seeding:
+                        # 站点已把这个种子算在本账号做种里，不必再下载
+                        # .torrent 校验；换辅种机重辅时关掉这个开关。
+                        skipped += 1
+                        site_skipped += 1
                         break
                     seeded_now = self.get_data(_SEEDED_KEY) or {}
                     # 同一个猪猪种子在同一台辅种机上只会有一个任务，所以判重
@@ -994,6 +1046,7 @@ class Piggo(_PluginBase):
                 "matched": matched,
                 "added": added,
                 "skipped": skipped,
+                "site_skipped": site_skipped,
                 "failed": failed,
             })
             elapsed = int(time.time() - started)
@@ -1126,6 +1179,81 @@ class Piggo(_PluginBase):
             logger=logger.info,
         )
 
+    def __api_client(self) -> Optional[PiggoApiClient]:
+        """没开开关或没配令牌时返回 None，整条新链路自动退化成旧行为。"""
+        if not (self._seed_api_index and self._api_token):
+            return None
+        return PiggoApiClient(
+            token=self._api_token,
+            proxy=self._proxy,
+            logger=logger.info,
+        )
+
+    def __refresh_index(
+        self, client: PiggoClient, index: Dict[int, dict]
+    ) -> Tuple[Dict[int, dict], str]:
+        """优先用实验室 API 增量刷新，失败回退前台列表。"""
+        api = self.__api_client()
+        if api is not None:
+            try:
+                saved = self.get_data(_API_CURSOR_KEY) or {}
+                last = str(saved.get("last_added_at") or "")
+                if not last:
+                    # 老索引是前台列表建的，没有 added_at；能推出一个水位
+                    # 就少拉一轮全量
+                    last = max(
+                        (
+                            str(item.get("added_at") or "")
+                            for item in index.values()
+                            if isinstance(item, dict)
+                        ),
+                        default="",
+                    )
+                fresh, cursor = api.build_incremental(
+                    last_added_at=last,
+                    max_pages=self._seed_pages or 100,
+                    on_progress=lambda page, total, count: logger.info(
+                        f"猪猪辅种：实验室 API 索引 {page}/{total}，本轮 {count} 条"
+                    ),
+                )
+                if cursor and cursor != last:
+                    self.save_data(_API_CURSOR_KEY, {
+                        "last_added_at": cursor,
+                        "updated": int(time.time()),
+                    })
+                logger.info(
+                    f"猪猪辅种：实验室 API 增量 {len(fresh)} 条，"
+                    f"水位 {last or '无'} -> {cursor or '无'}"
+                )
+                return fresh, "api"
+            except Exception as err:  # noqa: BLE001
+                logger.warning(
+                    f"猪猪辅种：实验室 API 索引失败，回退前台列表 {err}"
+                )
+        fresh = client.build_index(
+            pages=self._seed_pages,
+            on_progress=lambda page, total, count: logger.info(
+                f"猪猪辅种：索引 {page}/{total}，累计 {count} 条"
+            ),
+        )
+        return fresh, "web"
+
+    def __site_seeding_ids(self, stats: dict) -> set:
+        """拿站点当前做种清单做一层判重，失败时降级为只用本地记录。"""
+        api = self.__api_client()
+        if api is None or not self._seed_skip_site_seeding:
+            return set()
+        try:
+            ids = api.seeding_ids()
+            stats["site_seeding"] = len(ids)
+            logger.info(f"猪猪辅种：站点当前做种 {len(ids)} 个，纳入判重")
+            return ids
+        except Exception as err:  # noqa: BLE001
+            logger.warning(
+                f"猪猪辅种：读取站点做种清单失败，本轮只用本地判重 {err}"
+            )
+            return set()
+
     @staticmethod
     def __to_int(value: Any, default: int) -> int:
         try:
@@ -1175,9 +1303,12 @@ class Piggo(_PluginBase):
             "password": self._password,
             "visitorid": self._visitorid,
             "token": self._token,
+            "api_token": self._api_token,
             "site_id": self._site_id,
             "proxy": self._proxy,
             "seed_enabled": self._seed_enabled,
+            "seed_api_index": self._seed_api_index,
+            "seed_skip_site_seeding": self._seed_skip_site_seeding,
             "seed_cron": self._seed_cron,
             "seed_downloader": self._seed_downloader,
             "seed_source_downloader": self._seed_source_downloader,
@@ -1510,6 +1641,7 @@ class Piggo(_PluginBase):
         text = (
             f"主 {'/'.join(sources) or '自动'} -> 辅 {stats.get('downloader') or '自动'}\n"
             f"索引 {stats.get('index_total', 0)} 条（本轮刷新 {stats.get('index_new', 0)}）\n"
+            f"索引来源 {'实验室 API' if stats.get('index_source') == 'api' else '前台列表'}\n"
             f"本地已完成 {stats.get('local_done', 0)} 个\n"
             f"体积命中 {stats.get('hit', 0)} / 清单一致 {stats.get('matched', 0)}\n"
             f"新增 {stats.get('added', 0)}，已收录 {stats.get('skipped', 0)}，"

@@ -16,12 +16,19 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.error
+import urllib.request
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 DEFAULT_BASE = "https://piggo.me"
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+)
+# 实验室接口对 UA 有独立校验：curl 默认 UA 一律 403，必须带浏览器 UA
+API_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36"
 )
 
 # 猪猪站 SRP-6a 参数：512 字节模数、g=2、PBKDF2-SHA256 210000 轮。
@@ -537,6 +544,198 @@ class PiggoClient:
                 on_progress(page, total_pages, len(items))
             time.sleep(0.2)
         return items
+
+
+class PiggoApiClient:
+    """猪猪实验室开放 API 客户端（api.piggo.me/v1/api，Bearer 令牌）。
+
+    与前台 SRP 登录完全独立：不用 cookie、visitorid、HMAC 签名；令牌在
+    个人中心生成，等同账号密码。列表按 added_at 倒序分页，可做增量刷新。
+    注意接口在独立子域，主域 piggo.me/v1/api/* 一律返回 Cloudflare 挑战。
+    """
+
+    API_BASE = "https://api.piggo.me/v1/api/"
+
+    def __init__(
+        self,
+        token: str,
+        proxy: str = "",
+        timeout: int = 30,
+        logger: Optional[Callable[[str], None]] = None,
+    ) -> None:
+        self.token = (token or "").strip()
+        self.timeout = int(timeout or 30)
+        self._log = logger or (lambda msg: None)
+        # 显式清空代理：容器里可能继承一个不可达的 HTTP_PROXY 环境变量
+        self._direct = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        proxy = (proxy or "").strip()
+        self._proxied = (
+            urllib.request.build_opener(
+                urllib.request.ProxyHandler({"http": proxy, "https": proxy})
+            )
+            if proxy else None
+        )
+
+    def post(self, path: str, body: Optional[dict] = None) -> dict:
+        """调一个端点，返回 data；失败抛 PiggoError。"""
+        if not self.token:
+            raise PiggoError("未配置实验室 API 令牌")
+        request = urllib.request.Request(
+            self.API_BASE + path.lstrip("/"),
+            data=json.dumps(body if body is not None else {}).encode(),
+            headers={
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+                "Authorization": "Bearer " + self.token,
+                "User-Agent": API_USER_AGENT,
+            },
+        )
+        last_error = ""
+        # 直连优先，直连不通且配了代理时换代理再试一轮
+        for opener in (self._direct, self._proxied):
+            if opener is None:
+                continue
+            for attempt in range(3):
+                status, raw = 0, ""
+                try:
+                    with opener.open(request, timeout=self.timeout) as resp:
+                        status = resp.status
+                        raw = resp.read().decode("utf-8", "replace")
+                except urllib.error.HTTPError as err:
+                    status = err.code
+                    try:
+                        raw = err.read().decode("utf-8", "replace")
+                    except Exception:  # noqa: BLE001
+                        raw = ""
+                except Exception as err:  # noqa: BLE001
+                    last_error = f"{type(err).__name__}: {err}"
+                    time.sleep(2)
+                    continue
+                if status == 429:
+                    last_error = "429 限流"
+                    time.sleep(20 * (attempt + 1))
+                    continue
+                try:
+                    payload = json.loads(raw)
+                except ValueError:
+                    last_error = f"HTTP {status} 非 JSON 响应 {raw[:80]}"
+                    break
+                if status != 200:
+                    last_error = f"HTTP {status} {payload.get('msg') or raw[:80]}"
+                    if "notice_unread" in raw:
+                        last_error = "有未读必读公告，请到网站前台读完"
+                    break
+                if payload.get("code") not in (0, None):
+                    last_error = f"code {payload.get('code')} {payload.get('msg')}"
+                    break
+                return payload.get("data") or {}
+        raise PiggoError(f"实验室接口 {path} 调用失败：{last_error or '未知错误'}")
+
+    def torrents_page(self, page: int, per_page: int = 100) -> dict:
+        return self.post("torrents", {
+            "page": page,
+            "per_page": per_page,
+            "sort": "added_at",
+            "order": "desc",
+        })
+
+    def seeding_ids(self) -> set:
+        """站点当前做种的种子 id 集合，用于辅种判重，自动翻页。"""
+        ids: set = set()
+        page = 1
+        while page <= 20:
+            data = self.post("me/torrents", {"kind": "seeding", "page": page})
+            rows = data.get("items") or []
+            for item in rows:
+                try:
+                    ids.add(int(item["id"]))
+                except (KeyError, TypeError, ValueError):
+                    continue
+            try:
+                pages = int(data.get("pages") or 1)
+            except (TypeError, ValueError):
+                pages = 1
+            if not rows or page >= pages:
+                break
+            page += 1
+            time.sleep(0.5)
+        return ids
+
+    @staticmethod
+    def _normalize(item: dict) -> Optional[dict]:
+        def number(value: Any) -> int:
+            try:
+                return int(value or 0)
+            except (TypeError, ValueError):
+                return 0
+
+        try:
+            tid = int(item["id"])
+        except (KeyError, TypeError, ValueError):
+            return None
+        return {
+            "id": tid,
+            "name": item.get("name") or "",
+            "size": number(item.get("size")),
+            "seeders": number(item.get("seeders")),
+            "leechers": number(item.get("leechers")),
+            # 实验室接口不给下载权限位，能列出来即可下载
+            "can_download": True,
+            "added_at": str(item.get("added_at") or ""),
+        }
+
+    def build_incremental(
+        self,
+        last_added_at: str = "",
+        max_pages: int = 100,
+        per_page: int = 100,
+        on_progress: Optional[Callable[[int, int, int], None]] = None,
+    ) -> Tuple[Dict[int, dict], str]:
+        """按 added_at 倒序拉新种，返回 (新种字典, 本轮水位)。
+
+        last_added_at 为空表示首次全量（最多 100 页 / 1 万条，接口封顶）。
+        每页间隔 2.3 秒，避开 /torrents 的每分钟 30 次限流。中途某页失败
+        会抛异常且不推进水位，下一轮重拉，不会漏种。
+        """
+        last = str(last_added_at or "")
+        cursor = last
+        pages_cap = 100
+        if max_pages and int(max_pages) > 0:
+            pages_cap = min(pages_cap, int(max_pages))
+        items: Dict[int, dict] = {}
+        total_pages = pages_cap
+        for page in range(1, pages_cap + 1):
+            data = self.torrents_page(page, per_page)
+            rows = data.get("items") or []
+            if not rows:
+                break
+            try:
+                site_pages = int(data.get("pages") or 0)
+            except (TypeError, ValueError):
+                site_pages = 0
+            if site_pages:
+                total_pages = min(total_pages, site_pages)
+            fresh = 0
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                added = str(row.get("added_at") or "")
+                if last and added <= last:
+                    continue
+                norm = self._normalize(row)
+                if not norm:
+                    continue
+                items[norm["id"]] = norm
+                fresh += 1
+                if added > cursor:
+                    cursor = added
+            if on_progress:
+                on_progress(page, total_pages, len(items))
+            # 整页都旧、不满一页或已到站点最后一页，说明追上水位了
+            if fresh == 0 or len(rows) < per_page or page >= total_pages:
+                break
+            time.sleep(2.3)
+        return items, cursor
 
 
 # ---------------------------------------------------------------------- bencode
