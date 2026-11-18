@@ -144,7 +144,7 @@ def build_form(values: Dict[str, Any]) -> Tuple[List[dict], Dict[str, Any]]:
                     ]),
                     row([
                         col(3, textfield("seed_pages", "索引页数", type="number",
-                                         hint="0 表示全量（约 100 页 4 分钟）",
+                                         hint="站点封顶 100 页 / 1 万条；0 表示放开到上限",
                                          persistent_hint=True)),
                         col(3, textfield("seed_max_add", "单轮最多添加", type="number",
                                          hint="防止一次刷太多校验", persistent_hint=True)),
@@ -176,6 +176,10 @@ def build_form(values: Dict[str, Any]) -> Tuple[List[dict], Dict[str, Any]]:
                         col(12, switch("seed_onlyonce", "立即辅种一次", "info",
                                        hint="保存后 60 秒开始，不影响定时计划",
                                        persistent_hint=True)),
+                        col(12, switch("seed_full_once", "重建全量索引（只跑一次）", "warning",
+                                       hint="保存后 15 秒开始，按 12 个分类 + 年份切片建索引，"
+                                            "约 30 到 60 分钟；跑完自动复位",
+                                       persistent_hint=True)),
                     ]),
                 ]),
 
@@ -185,6 +189,9 @@ def build_form(values: Dict[str, Any]) -> Tuple[List[dict], Dict[str, Any]]:
                 alert("warning", "签到功能已在 2.2 移除：站点风控命中必返 422 need_captcha，"
                                  "而 /v1/web/captcha 图片码接口在站点侧没配置好，真实浏览器同样签不了，"
                                  "只能去网页日历手动点。留着只会每天推一条失败通知。"),
+                alert("info", "索引上限：站点前后台都只放最新 1 万条（100 页），第 101 页起返回的还是末页，"
+                              "换令牌也没用。日常增量够用；要补 2022 年以来的老种子，"
+                              "用调试卡里的「重建全量索引」，按分类 + 年份切片能拿 6 万条以上。"),
             ],
         },
     ]
@@ -215,4 +222,5 @@ def build_form(values: Dict[str, Any]) -> Tuple[List[dict], Dict[str, Any]]:
         "seed_search": values.get("seed_search", True),
         "seed_search_limit": values.get("seed_search_limit", 400),
         "seed_onlyonce": False,
+        "seed_full_once": False,
     }

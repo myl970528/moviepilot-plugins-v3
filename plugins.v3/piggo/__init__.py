@@ -55,6 +55,7 @@ _DEFAULT_SEED_CRON = "15 5 * * *"
 _INDEX_FILE = "piggo_index.json"
 _SEEDED_KEY = "seed_seeded"
 _SEED_STATS_KEY = "seed_stats"
+_FULL_INDEX_STATS_KEY = "piggo_full_stats"
 _API_CURSOR_KEY = "piggo_api_cursor"
 
 
@@ -150,11 +151,11 @@ class Piggo(_PluginBase):
     # 插件名称
     plugin_name = "猪猪"
     # 插件描述
-    plugin_desc = "猪猪站一体化：索引搜索、自动辅种。"
+    plugin_desc = "猪猪站一体化：索引搜索、按分类重建全量索引、自动辅种。"
     # 插件图标
     plugin_icon = "spider.png"
     # 插件版本
-    plugin_version = "2.2"
+    plugin_version = "2.3"
     # 插件作者
     plugin_author = "hermes"
     # 作者主页
@@ -194,11 +195,14 @@ class Piggo(_PluginBase):
     _seed_onlyonce: bool = False
     _seed_search: bool = True
     _seed_search_limit: int = 400
+    _seed_full_once: bool = False
 
     # ---- 签到已移除（2.2）：站点风控无解，老配置里的 sign_* 键留着无害，不再读取
 
     _seed_running: bool = False
     _seed_lock = threading.Lock()
+    _full_running: bool = False
+    _full_lock = threading.Lock()
 
     # ------------------------------------------------------------------ 生命周期
     def init_plugin(self, config: Optional[dict] = None) -> None:
@@ -244,6 +248,7 @@ class Piggo(_PluginBase):
             self._seed_min_seeders = self.__to_int(config.get("seed_min_seeders"), 0)
             self._seed_search = bool(config.get("seed_search", True))
             self._seed_search_limit = self.__to_int(config.get("seed_search_limit"), 400)
+            self._seed_full_once = bool(config.get("seed_full_once"))
 
         try:
             self._install()
@@ -255,6 +260,11 @@ class Piggo(_PluginBase):
             self.__save_config()
             logger.info("猪猪辅种：收到立即执行指令，60 秒后开始")
             threading.Timer(60, self.run_seed_task).start()
+        if self._seed_full_once:
+            self._seed_full_once = False
+            self.__save_config()
+            logger.info("猪猪索引：收到全量重建指令，15 秒后开始")
+            threading.Timer(15, self.run_full_index_task).start()
 
     def get_state(self) -> bool:
         return bool(self._enabled)
@@ -375,6 +385,7 @@ class Piggo(_PluginBase):
             "seed_dryrun": self._seed_dryrun,
             "seed_search": self._seed_search,
             "seed_search_limit": self._seed_search_limit,
+            "seed_full_once": self._seed_full_once,
         }
 
     # ------------------------------------------------------------------ 详情页
@@ -559,6 +570,16 @@ class Piggo(_PluginBase):
             stat_cell("主下载器", "、".join(stats.get("sources") or []) or "自动"),
             stat_cell("辅种下载器", stats.get("downloader") or "自动"),
         ]
+        full_stats = self.get_data(_FULL_INDEX_STATS_KEY) or {}
+        if full_stats.get("before") is not None:
+            detail.append(stat_cell(
+                "全量索引",
+                f"{full_stats.get('before')} → {full_stats.get('after')}",
+                "success",
+            ))
+            detail.append(stat_cell(
+                "全量重建于", full_stats.get("finished_at"), "info"
+            ))
 
         page.append({
             "component": "VRow",
@@ -623,7 +644,28 @@ class Piggo(_PluginBase):
                 "auth": "apikey",
                 "summary": "查询状态",
             },
+            {
+                "path": "/full_index",
+                "endpoint": self.api_full_index,
+                "methods": ["POST"],
+                "auth": "apikey",
+                "summary": "按分类重建全量索引（约 30 分钟）",
+            },
         ]
+
+    async def api_full_index(self) -> dict:
+        if not self._api_token:
+            return {"success": False, "message": "未配置实验室 API 令牌"}
+        with self._full_lock:
+            if self._full_running:
+                return {"success": False, "message": "全量索引正在运行"}
+            self._full_running = True
+        threading.Thread(
+            target=self.run_full_index_task,
+            kwargs={"claimed": True},
+            daemon=True,
+        ).start()
+        return {"success": True, "message": "已启动全量索引重建"}
 
     async def api_seed(self) -> dict:
         if self._seed_running:
@@ -635,9 +677,96 @@ class Piggo(_PluginBase):
         return {
             "success": True,
             "seed_running": self._seed_running,
+            "full_running": self._full_running,
             "seed_stats": self.get_data(_SEED_STATS_KEY) or {},
+            "full_stats": self.get_data(_FULL_INDEX_STATS_KEY) or {},
             "seeded": len(self.get_data(_SEEDED_KEY) or {}),
         }
+
+    def run_full_index_task(self, claimed: bool = False) -> None:
+        """按分类 + 年份切片重建全量索引，跑完合并进现有索引。
+
+        一次性的活：接口 1 万条窗口导致普通增量只覆盖最新 1 万条，
+        分类窗口各自独立，合起来能补到 2022 年。跑完把水位推到最新，
+        下一轮日常增量不会重拉。
+        """
+        if not claimed:
+            with self._full_lock:
+                if self._full_running:
+                    logger.warning("猪猪全量索引：上一轮尚未结束，跳过")
+                    return
+                self._full_running = True
+        started = time.time()
+        stats: Dict[str, Any] = {}
+        try:
+            api = self.__api_client()
+            if api is None:
+                raise RuntimeError("未启用实验室 API 或未配置令牌")
+
+            def progress(tag: str, page: int, total: int, count: int) -> None:
+                if page % 10 == 0 or page == total:
+                    logger.info(
+                        f"猪猪全量索引：{tag} {page}/{total}，已收 {count} 条"
+                    )
+
+            logger.info("猪猪全量索引：开始按分类遍历（预计 30 到 60 分钟）")
+            fresh = api.build_full_index(on_progress=progress)
+            if not fresh:
+                raise RuntimeError("所有分类都没拿到数据，索引未改动")
+
+            index = self.__load_index()
+            before = len(index)
+            index.update(fresh)
+            self.__save_index(index)
+            cursor = max(
+                (
+                    str(item.get("added_at") or "")
+                    for item in fresh.values()
+                    if isinstance(item, dict)
+                ),
+                default="",
+            )
+            if cursor:
+                self.save_data(_API_CURSOR_KEY, {
+                    "last_added_at": cursor,
+                    "updated": int(time.time()),
+                })
+            stats = {
+                "before": before,
+                "after": len(index),
+                "fresh": len(fresh),
+                "elapsed": int(time.time() - started),
+                "finished_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "message": "",
+            }
+            self.save_data(_FULL_INDEX_STATS_KEY, stats)
+            logger.info(
+                f"猪猪全量索引：完成，{before} -> {len(index)} 条，"
+                f"耗时 {stats['elapsed']} 秒"
+            )
+            if self._seed_notify:
+                try:
+                    self.post_message(
+                        mtype=NotificationType.Plugin,
+                        title="【猪猪全量索引完成】",
+                        text=(
+                            f"索引 {before} -> {len(index)} 条"
+                            f"（本轮新增 {len(index) - before}）\n"
+                            f"水位 {cursor or '无'}\n"
+                            f"耗时 {stats['elapsed']} 秒"
+                        ),
+                    )
+                except Exception as err:  # noqa: BLE001
+                    logger.warning(f"猪猪全量索引：发送通知失败 {err}")
+        except Exception as err:  # noqa: BLE001
+            logger.error(f"猪猪全量索引：失败 {err}")
+            stats = {
+                "message": str(err),
+                "finished_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            }
+            self.save_data(_FULL_INDEX_STATS_KEY, stats)
+        finally:
+            self._full_running = False
 
     # ------------------------------------------------------------------ 辅种主流程
     def run_seed_task(self) -> None:
@@ -1141,6 +1270,7 @@ class Piggo(_PluginBase):
             "seed_onlyonce": False,
             "seed_search": self._seed_search,
             "seed_search_limit": self._seed_search_limit,
+            "seed_full_once": False,
         })
 
     @property

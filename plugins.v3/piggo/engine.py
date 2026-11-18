@@ -482,13 +482,15 @@ class PiggoApiClient:
                 return payload.get("data") or {}
         raise PiggoError(f"实验室接口 {path} 调用失败：{last_error or '未知错误'}")
 
-    def torrents_page(self, page: int, per_page: int = 100) -> dict:
-        return self.post("torrents", {
+    def torrents_page(self, page: int, per_page: int = 100, **extra: Any) -> dict:
+        body = {
             "page": page,
             "per_page": per_page,
             "sort": "added_at",
             "order": "desc",
-        })
+        }
+        body.update(extra)
+        return self.post("torrents", body)
 
     def seeding_ids(self) -> set:
         """站点当前做种的种子 id 集合，用于辅种判重，自动翻页。"""
@@ -587,6 +589,88 @@ class PiggoApiClient:
                 break
             time.sleep(2.3)
         return items, cursor
+
+    def build_full_index(
+        self,
+        categories: Optional[List[int]] = None,
+        years: Optional[List[int]] = None,
+        max_pages: int = 100,
+        per_page: int = 100,
+        on_progress: Optional[Callable[[str, int, int, int], None]] = None,
+    ) -> Dict[int, dict]:
+        """按分类遍历全站索引，绕过接口「最新 1 万条」的窗口。
+
+        站点 /torrents 和前台 /v1/web/torrents 都把 total 钉在 10000、
+        pages 钉在 100，page 超过 100 会被夹回末页；但 category 和 q
+        各自有独立窗口且可叠加。实测分类 1..12 合计约 6.5 万条，其中
+        分类 1 和 11 仍被夹在 1 万，再按年份 q 切片继续往下补。
+
+        只做一次性全量重建用；日常增量仍走 build_incremental。
+        """
+        cats = list(categories) if categories is not None else list(range(1, 13))
+        yrs = list(years) if years is not None else list(range(2015, 2027))
+        items: Dict[int, dict] = {}
+        failures: List[str] = []
+
+        def pull(extra: dict, tag: str) -> Tuple[Dict[int, dict], int]:
+            got: Dict[int, dict] = {}
+            total_pages = max_pages
+            site_total = 0
+            for page in range(1, max_pages + 1):
+                data = self.torrents_page(page, per_page, **extra)
+                rows = data.get("items") or []
+                if not rows:
+                    break
+                try:
+                    site_pages = int(data.get("pages") or 0)
+                    site_total = int(data.get("total") or 0)
+                except (TypeError, ValueError):
+                    site_pages, site_total = 0, 0
+                if site_pages:
+                    total_pages = min(total_pages, site_pages)
+                for row in rows:
+                    norm = self._normalize(row)
+                    if norm:
+                        got[norm["id"]] = norm
+                if on_progress:
+                    on_progress(tag, page, total_pages, len(got))
+                if len(rows) < per_page or page >= total_pages:
+                    break
+                time.sleep(2.3)
+            return got, site_total
+
+        for cid in cats:
+            tag = f"分类{cid}"
+            try:
+                got, total = pull({"category": cid}, tag)
+            except Exception as err:  # noqa: BLE001
+                failures.append(f"{tag}: {type(err).__name__} {err}")
+                self._log(f"猪猪全量索引：{tag} 失败，跳过 {err}")
+                continue
+            items.update(got)
+            self._log(f"猪猪全量索引：{tag} 完成 {len(got)} 条（total={total}）")
+            if total < 10000:
+                continue
+            # 这个分类被 1 万窗口夹住了，按年份关键词继续往下挖
+            for year in yrs:
+                ytag = f"分类{cid}/{year}"
+                try:
+                    extra_got, _ = pull(
+                        {"category": cid, "q": str(year)}, ytag
+                    )
+                except Exception as err:  # noqa: BLE001
+                    failures.append(f"{ytag}: {type(err).__name__} {err}")
+                    self._log(f"猪猪全量索引：{ytag} 失败，跳过 {err}")
+                    continue
+                items.update(extra_got)
+                self._log(f"猪猪全量索引：{ytag} 补充 {len(extra_got)} 条")
+
+        if failures:
+            self._log(
+                f"猪猪全量索引：{len(failures)} 个切片失败，"
+                f"已拿到的 {len(items)} 条仍然有效"
+            )
+        return items
 
 
 # ---------------------------------------------------------------------- bencode
