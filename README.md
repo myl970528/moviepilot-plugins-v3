@@ -9,6 +9,7 @@
 | **Piggo（猪猪）** | 2.1 | 猪猪站（piggo.me）一体化：搜索索引 + 跨站自动辅种（可选实验室 API 增量索引）+ 每日签到 |
 | **CustomSiteData（自定义站点数据）** | 1.1 | 给自定义站点注入用户数据解析器 schema，修「更新数据」报 schema：None |
 | **QingwaDaily（青蛙每日福利）** | 1.0 | 每天自动买青蛙蝌蚪商店的「每日福利：1000蝌蚪」，1 蝌蚪换 1000 |
+| **HdhSignIn（栖影签到）** | 1.0 | 栖影 HDHaven 每日签到，Browserless 解 Turnstile 后同会话签到，不存 Cookie |
 
 ## 安装
 
