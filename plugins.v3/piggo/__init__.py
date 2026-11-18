@@ -48,7 +48,9 @@ from .spider import PiggoSpider, start_dl_server
 
 _PARSER_NAME = "Piggo"
 _DEFAULT_DOMAIN = "piggo.me"
-_DEFAULT_VISITORID = "99e9943aec19cff88977be9093dd2e12"
+# visitorid 是设备指纹，与登录会话绑定；必须每个使用者自己在配置里填，
+# 内置默认值会让所有安装者共用同一指纹，既泄露又容易触发站点风控。
+_DEFAULT_VISITORID = ""
 _DEFAULT_PROXY = "http://192.168.0.11:7890"
 _DEFAULT_SEED_CRON = "15 5 * * *"
 
@@ -155,7 +157,7 @@ class Piggo(_PluginBase):
     # 插件图标
     plugin_icon = "spider.png"
     # 插件版本
-    plugin_version = "2.3"
+    plugin_version = "2.4"
     # 插件作者
     plugin_author = "hermes"
     # 作者主页

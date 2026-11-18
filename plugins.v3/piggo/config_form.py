@@ -98,8 +98,9 @@ def build_form(values: Dict[str, Any]) -> Tuple[List[dict], Dict[str, Any]]:
                                          persistent_hint=True, clearable=True)),
                     ]),
                     row([
-                        col(6, textfield("visitorid", "visitorid",
-                                         hint="站点设备指纹，换掉会被风控",
+                        col(6, textfield("visitorid", "visitorid（必填）",
+                                         hint="站点设备指纹，自己从浏览器抓；换掉会被风控。"
+                                              "插件不内置任何人的指纹",
                                          persistent_hint=True, clearable=True)),
                         col(6, textfield("proxy", "代理地址",
                                          placeholder="http://192.168.0.11:7890",
