@@ -9,7 +9,7 @@
 | **Piggo（猪猪）** | 2.1 | 猪猪站（piggo.me）一体化：搜索索引 + 跨站自动辅种（可选实验室 API 增量索引）+ 每日签到 |
 | **CustomSiteData（自定义站点数据）** | 1.1 | 给自定义站点注入用户数据解析器 schema，修「更新数据」报 schema：None |
 | **QingwaDaily（青蛙每日福利）** | 1.0 | 每天自动买青蛙蝌蚪商店的「每日福利：1000蝌蚪」，1 蝌蚪换 1000 |
-| **HdhSignIn（栖影签到）** | 1.0 | 栖影 HDHaven 每日签到，Browserless 解 Turnstile 后同会话签到，不存 Cookie |
+| **HdhSignIn（栖影签到）** | 1.1 | 栖影 HDHaven 每日签到，Browserless 解 Turnstile 后同会话签到，不存 Cookie |
 
 ## 安装
 
@@ -43,6 +43,15 @@ naxx.xxx=NexusPhp
 
 QingwaDaily 另带一个 `install.sh`：容器重建或插件从页面消失后，在宿主机执行
 `sh install.sh`，会自动从容器挂载点推断插件目录、重建软链，最后提示重启容器。
+
+HdhSignIn 需要三个配置项：栖影的账号、密码，以及一个 Browserless 令牌。签到页是 Cloudflare
+Turnstile，且登录会话绑出口 IP，所以插件不保存 Cookie，每次执行都在 Browserless 里开新会话：
+打开 `/login` → `solve(type: cloudflare)` 解人机验证 → 原生 setter 填表提交 → 在同一个浏览器上下文里
+请求 `/api/auth/me` 和 `/api/account/checkin`。成功后日志与通知里会带当前积分和等级，
+今天已经签过则返回「今日已签到，当前 N 积分」。
+
+> 家宽 IP 被站点拉黑时页面根本打不开，这种情况换节点没用，只能走 Browserless 的云端出口。
+> 令牌在 browserless.io 后台取，地址填 `https://production-sfo.browserless.io`（同区域可选 ams/lon）。
 
 ## sites/ 目录
 
