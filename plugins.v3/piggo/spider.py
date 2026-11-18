@@ -34,10 +34,10 @@ _DEFAULT_UA = (
 )
 
 # visitorid 由客户端生成并与 token 绑定：一旦登录即固定，换值等于换会话。
-_DEFAULT_VISITORID = ""
+_DEFAULT_VISITORID = "99e9943aec19cff88977be9093dd2e12"
 
-# 直连被 reset 时可配代理兜底，默认留空走直连。
-_PROXY = os.getenv("PIGGO_PROXY", "")
+# 直连被 reset 时走旁路由代理兜底。
+_PROXY = os.getenv("PIGGO_PROXY", "http://192.168.0.11:7890")
 
 # 签名密钥缓存 10 分钟，过期自动重取。
 _SIGN_TTL = 600.0

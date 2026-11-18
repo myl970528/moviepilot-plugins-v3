@@ -1,29 +1,30 @@
 # -*- coding: utf-8 -*-
 """猪猪 (piggo.me) 站点一体化插件。
 
-一个插件覆盖三件事：
+一个插件覆盖两件事：
 
   索引：把 PiggoSpider 注入 MP 索引器体系，给 piggo.me 注册索引配置，
         并启动本地下载代理，让站点搜索与下载可用。
   辅种：拉全站列表建本地索引，按「总字节数相等 + 文件清单完全一致」
         跨站匹配本地已完成种子，校验通过后自动做种。
-  签到：站点把签到做成万年历（/calendar），每日调 /calendar/attendance，
-        风控命中时用图片验证码补交。
 
 索引优先走个人中心的实验室 API（Bearer 令牌 + added_at 增量），没配令牌
-或 API 失败时回退前台列表；种子下载与搜索仍走前台 SRP-6a 登录。
-签到依赖 SRP，token 失效由各自模块自动重登。
+或 API 失败时回退前台列表；种子下载与搜索仍走前台 SRP-6a 登录，token 失效
+自动重登。
+
+签到功能已于 2.2 移除：站点把签到做成万年历（/calendar），风控命中必返
+422 need_captcha，而 /v1/web/captcha 图片码接口在站点侧未正确配置，真实
+浏览器同样签不了，只能人工去网页点。留着只会每天推一条失败通知。
 """
 from __future__ import annotations
 
 import json
 import os
 import re
-import sys
 import threading
 import time
 from datetime import datetime
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import quote
 
 from apscheduler.triggers.cron import CronTrigger
@@ -47,15 +48,13 @@ from .spider import PiggoSpider, start_dl_server
 
 _PARSER_NAME = "Piggo"
 _DEFAULT_DOMAIN = "piggo.me"
-_DEFAULT_VISITORID = ""
-_DEFAULT_PROXY = ""
+_DEFAULT_VISITORID = "99e9943aec19cff88977be9093dd2e12"
+_DEFAULT_PROXY = "http://192.168.0.11:7890"
 _DEFAULT_SEED_CRON = "15 5 * * *"
-_DEFAULT_SIGN_CRON = "20 8 * * *"
 
 _INDEX_FILE = "piggo_index.json"
 _SEEDED_KEY = "seed_seeded"
 _SEED_STATS_KEY = "seed_stats"
-_SIGN_STATS_KEY = "sign_stats"
 _API_CURSOR_KEY = "piggo_api_cursor"
 
 
@@ -151,11 +150,11 @@ class Piggo(_PluginBase):
     # 插件名称
     plugin_name = "猪猪"
     # 插件描述
-    plugin_desc = "猪猪站一体化：索引搜索、自动辅种、每日签到。"
+    plugin_desc = "猪猪站一体化：索引搜索、自动辅种。"
     # 插件图标
     plugin_icon = "spider.png"
     # 插件版本
-    plugin_version = "2.1"
+    plugin_version = "2.2"
     # 插件作者
     plugin_author = "hermes"
     # 作者主页
@@ -196,16 +195,10 @@ class Piggo(_PluginBase):
     _seed_search: bool = True
     _seed_search_limit: int = 400
 
-    # ---- 签到
-    _sign_enabled: bool = False
-    _sign_cron: str = _DEFAULT_SIGN_CRON
-    _sign_notify: bool = True
-    _sign_captcha: bool = True
-    _sign_onlyonce: bool = False
+    # ---- 签到已移除（2.2）：站点风控无解，老配置里的 sign_* 键留着无害，不再读取
 
     _seed_running: bool = False
     _seed_lock = threading.Lock()
-    _ocr: Any = None
 
     # ------------------------------------------------------------------ 生命周期
     def init_plugin(self, config: Optional[dict] = None) -> None:
@@ -252,12 +245,6 @@ class Piggo(_PluginBase):
             self._seed_search = bool(config.get("seed_search", True))
             self._seed_search_limit = self.__to_int(config.get("seed_search_limit"), 400)
 
-            self._sign_enabled = bool(config.get("sign_enabled"))
-            self._sign_cron = str(config.get("sign_cron") or _DEFAULT_SIGN_CRON).strip()
-            self._sign_notify = bool(config.get("sign_notify", True))
-            self._sign_captcha = bool(config.get("sign_captcha", True))
-            self._sign_onlyonce = bool(config.get("sign_onlyonce"))
-
         try:
             self._install()
         except Exception as err:  # noqa: BLE001
@@ -268,11 +255,6 @@ class Piggo(_PluginBase):
             self.__save_config()
             logger.info("猪猪辅种：收到立即执行指令，60 秒后开始")
             threading.Timer(60, self.run_seed_task).start()
-        if self._sign_onlyonce:
-            self._sign_onlyonce = False
-            self.__save_config()
-            logger.info("猪猪签到：收到立即执行指令，20 秒后开始")
-            threading.Timer(20, self.run_sign_task).start()
 
     def get_state(self) -> bool:
         return bool(self._enabled)
@@ -348,16 +330,6 @@ class Piggo(_PluginBase):
                     "kwargs": {"minutes": 5},
                 })
 
-        if self._sign_enabled:
-            trigger = self.__cron(self._sign_cron, "签到")
-            if trigger:
-                services.append({
-                    "id": "PiggoSignIn",
-                    "name": "猪猪每日签到",
-                    "trigger": trigger,
-                    "func": self.run_sign_task,
-                    "kwargs": {},
-                })
         return services
 
     @staticmethod
@@ -370,208 +342,250 @@ class Piggo(_PluginBase):
 
     # ------------------------------------------------------------------ 配置页
     def get_form(self) -> Tuple[List[dict], Dict[str, Any]]:
-        downloaders = []
-        try:
-            services = DownloaderHelper().get_services()
-            downloaders = [
-                {"title": f"{name} ({info.type})", "value": name}
-                for name, info in (services or {}).items()
-                if info and info.type == "transmission"
-            ]
-        except Exception as err:  # noqa: BLE001
-            logger.warning(f"猪猪：读取下载器列表失败 {err}")
+        from .config_form import build_form
+        return build_form(self.__current_config())
 
-        return [
-            {
-                "component": "VForm",
-                "content": [
-                    self.__section(
-                        "站点与索引",
-                        "账号密码用于自动登录，token 留空即可（插件自动获取并续期）。"
-                        "实验室 API 令牌用于免登录态增量刷新辅种索引，等同账号密码，"
-                        "留空则索引继续走前台列表。开启索引后，站点管理里的"
-                        "猪猪站可搜索与下载。",
-                    ),
-                    {
-                        "component": "VRow",
-                        "content": [
-                            self.__col(3, self.__switch("enabled", "启用索引")),
-                            self.__col(3, self.__field("domain", "域名")),
-                            self.__col(3, self.__field("username", "账号")),
-                            self.__col(3, self.__field("password", "密码", "password")),
-                        ],
-                    },
-                    {
-                        "component": "VRow",
-                        "content": [
-                            self.__col(6, self.__field("visitorid", "visitorid")),
-                            self.__col(6, self.__field("proxy", "代理地址（留空为直连）")),
-                        ],
-                    },
-                    {
-                        "component": "VRow",
-                        "content": [
-                            self.__col(12, self.__field(
-                                "token", "token（可留空，自动维护）")),
-                        ],
-                    },
-                    {
-                        "component": "VRow",
-                        "content": [
-                            self.__col(12, self.__field(
-                                "api_token",
-                                "实验室 API 令牌（个人中心生成，可留空）",
-                                "password")),
-                        ],
-                    },
-
-                    self.__section(
-                        "自动辅种",
-                        "主辅分离：主下载器只负责提供「本地已完成种子」清单，"
-                        "辅种下载器只负责新增辅种，两台各管一头。"
-                        "按总字节数相等 + 文件清单完全一致跨站匹配，校验满 100% 才开始做种。"
-                        "配置实验室 API 令牌后，索引按发布时间增量刷新，并用站点当前做种"
-                        "清单提前判重；索引页数填 0 表示拉满 100 页（约 4 分钟）。",
-                    ),
-                    {
-                        "component": "VRow",
-                        "content": [
-                            self.__col(3, self.__switch("seed_enabled", "启用辅种")),
-                            self.__col(3, self.__field("seed_cron", "执行周期")),
-                            self.__col(3, self.__switch("seed_notify", "辅种通知")),
-                            self.__col(3, self.__switch("seed_onlyonce", "立即辅种一次")),
-                        ],
-                    },
-                    {
-                        "component": "VRow",
-                        "content": [
-                            self.__col(6, self.__switch(
-                                "seed_api_index", "用实验室 API 增量刷新索引")),
-                            self.__col(6, self.__switch(
-                                "seed_skip_site_seeding",
-                                "跳过站点已在做种的种子（换辅种机时请关闭）")),
-                        ],
-                    },
-                    {
-                        "component": "VRow",
-                        "content": [
-                            self.__col(6, {
-                                "component": "VSelect",
-                                "props": {
-                                    "model": "seed_source_downloader",
-                                    "label": "主下载器（扫描已完成种子）",
-                                    "items": downloaders,
-                                    "multiple": True,
-                                    "chips": True,
-                                    "clearable": True,
-                                    "hint": "可多选；留空表示所有可用的 Transmission",
-                                    "persistent-hint": True,
-                                },
-                            }),
-                            self.__col(6, {
-                                "component": "VSelect",
-                                "props": {
-                                    "model": "seed_downloader",
-                                    "label": "辅种下载器（只加辅种）",
-                                    "items": downloaders,
-                                    "clearable": True,
-                                    "hint": "新增辅种只加这一台；留空退回第一个可用 Transmission",
-                                    "persistent-hint": True,
-                                },
-                            }),
-                        ],
-                    },
-                    {
-                        "component": "VRow",
-                        "content": [
-                            self.__col(3, self.__field("seed_pages", "索引页数（0 全量）")),
-                            self.__col(3, self.__field("seed_max_add", "单轮最多添加")),
-                            self.__col(3, self.__field("seed_label", "做种标签")),
-                            self.__col(3, self.__field("seed_min_seeders", "最低做种人数")),
-                        ],
-                    },
-                    {
-                        "component": "VRow",
-                        "content": [
-                            self.__col(6, self.__switch("seed_auto_start", "校验完自动做种")),
-                            self.__col(6, self.__switch("seed_dryrun", "只匹配不添加")),
-                        ],
-                    },
-                    {
-                        "component": "VRow",
-                        "content": [
-                            self.__col(6, self.__switch(
-                                "seed_search", "索引未命中时按名称搜索兜底")),
-                            self.__col(6, self.__field(
-                                "seed_search_limit", "单轮搜索上限")),
-                        ],
-                    },
-
-                    self.__section(
-                        "每日签到",
-                        "站点签到做成万年历，接口为 /v1/web/calendar。"
-                        "风控命中时返回 422 要求人机验证，站点前端没有配置任何"
-                        "验证码组件，浏览器同样签不了，只能去网页手动签到；"
-                        "插件会把结果推送提醒。",
-                    ),
-                    {
-                        "component": "VRow",
-                        "content": [
-                            self.__col(3, self.__switch("sign_enabled", "启用签到")),
-                            self.__col(3, self.__field("sign_cron", "执行周期")),
-                            self.__col(3, self.__switch("sign_notify", "签到通知")),
-                            self.__col(3, self.__switch("sign_onlyonce", "立即签到一次")),
-                        ],
-                    },
-                    {
-                        "component": "VRow",
-                        "content": [
-                            self.__col(4, self.__switch(
-                                "sign_captcha", "尝试识别图片验证码（通常无效）")),
-                        ],
-                    },
-                ],
-            }
-        ], {
+    def __current_config(self) -> Dict[str, Any]:
+        return {
             "enabled": self._enabled,
             "domain": self._domain,
+            "site_id": self._site_id,
             "username": self._username,
             "password": self._password,
             "visitorid": self._visitorid,
+            "proxy": self._proxy,
             "token": self._token,
             "api_token": self._api_token,
-            "site_id": self._site_id,
-            "proxy": self._proxy,
             "seed_enabled": self._seed_enabled,
+            "seed_cron": self._seed_cron,
+            "seed_notify": self._seed_notify,
             "seed_api_index": self._seed_api_index,
             "seed_skip_site_seeding": self._seed_skip_site_seeding,
-            "seed_cron": self._seed_cron,
-            "seed_downloader": self._seed_downloader,
             "seed_source_downloader": [
                 item.strip()
                 for item in self._seed_source_downloader.split(",")
                 if item.strip()
             ],
+            "seed_downloader": self._seed_downloader,
             "seed_pages": self._seed_pages,
             "seed_max_add": self._seed_max_add,
             "seed_label": self._seed_label,
             "seed_min_seeders": self._seed_min_seeders,
             "seed_auto_start": self._seed_auto_start,
             "seed_dryrun": self._seed_dryrun,
-            "seed_notify": self._seed_notify,
-            "seed_onlyonce": False,
             "seed_search": self._seed_search,
             "seed_search_limit": self._seed_search_limit,
-            "sign_enabled": self._sign_enabled,
-            "sign_cron": self._sign_cron,
-            "sign_notify": self._sign_notify,
-            "sign_captcha": self._sign_captcha,
-            "sign_onlyonce": False,
         }
 
-    @staticmethod
-    def __section(title: str, desc: str) -> dict:
-        return {
+    # ------------------------------------------------------------------ 详情页
+    def get_page(self) -> List[dict]:
+        """统计页：KPI + 最近辅种记录 + 上轮运行统计。
+
+        全部读本地缓存，渲染时不去登录站点：辅种一轮要几分钟，为了刷新
+        一个数字去开一次会话不值当。
+        """
+        stats = self.get_data(_SEED_STATS_KEY) or {}
+        seeded = self.get_data(_SEEDED_KEY) or {}
+        records = sorted(
+            [r for r in seeded.values() if isinstance(r, dict)],
+            key=lambda x: str(x.get("at") or ""),
+            reverse=True,
+        )
+        seeding = sum(1 for r in records if r.get("state") == "seeding")
+        verifying = sum(1 for r in records if r.get("state") == "verifying")
+        nodata = sum(1 for r in records if r.get("state") == "nodata")
+
+        def kpi(icon: str, label: str, value: str, color: str = "",
+                note: str = "") -> dict:
+            value_cls = (f"text-h6 font-weight-bold text-{color}" if color
+                         else "text-h6 font-weight-bold")
+            children = [
+                {"component": "VIcon",
+                 "props": {"color": color or "primary", "size": "28", "class": "mb-1"},
+                 "text": icon},
+                {"component": "span", "props": {
+                    "class": value_cls,
+                    "style": "display:block; font-size: clamp(0.8rem, 3.8vw, 1.25rem);"
+                             " white-space: normal; overflow-wrap: anywhere;"
+                             " word-break: break-all; line-height: 1.2;",
+                }, "text": value},
+                {"component": "span",
+                 "props": {"class": "text-caption text-medium-emphasis d-block mt-1"},
+                 "text": label},
+            ]
+            if note:
+                children.append({"component": "div",
+                                 "props": {"class": "text-caption text-medium-emphasis"},
+                                 "text": note})
+            return {
+                "component": "VCard",
+                "props": {"variant": "tonal", "class": "h-100"},
+                "content": [{"component": "VCardText",
+                             "props": {"class": "text-center pa-3"},
+                             "content": children}],
+            }
+
+        source = "实验室 API" if stats.get("index_source") == "api" else "前台列表"
+        last_run = str(stats.get("finished_at") or "") or "尚未运行"
+        kpis = [
+            ("mdi-database", "索引条数",
+             f"{int(stats.get('index_total') or 0):,}", "primary",
+             f"本轮刷新 {int(stats.get('index_new') or 0):,} 条 · {source}"),
+            ("mdi-file-check", "本地已完成",
+             f"{int(stats.get('local_done') or 0):,}", "info",
+             f"体积命中 {int(stats.get('hit') or 0):,}"),
+            ("mdi-upload-network", "当前做种",
+             f"{seeding:,}", "success",
+             f"校验中 {verifying:,} · 无数据 {nodata:,}"),
+            ("mdi-clock-outline", "上次运行", last_run, "warning",
+             f"耗时 {stats.get('elapsed', 0)} 秒" if stats else "点「立即辅种一次」试跑"),
+        ]
+
+        page: List[dict] = [{
+            "component": "VRow",
+            "props": {"dense": True},
+            "content": [
+                {"component": "VCol", "props": {"cols": 6, "md": 6},
+                 "content": [kpi(*kpis[0])]},
+                {"component": "VCol", "props": {"cols": 6, "md": 6},
+                 "content": [kpi(*kpis[1])]},
+                {"component": "VCol", "props": {"cols": 6, "md": 6},
+                 "content": [kpi(*kpis[2])]},
+                {"component": "VCol", "props": {"cols": 6, "md": 6},
+                 "content": [kpi(*kpis[3])]},
+            ],
+        }]
+
+        state_map = {
+            "seeding": ("做种中", "success"),
+            "verifying": ("校验中", "warning"),
+            "nodata": ("无数据", "error"),
+        }
+        rows = []
+        for idx, item in enumerate(records[:30], start=1):
+            state_text, state_color = state_map.get(
+                str(item.get("state")), ("未知", "medium-emphasis")
+            )
+            name = str(item.get("name") or "")
+            rows.append([
+                (str(idx), "text-body-2 text-medium-emphasis"),
+                (str(item.get("at") or "—"), "text-body-2 text-no-wrap"),
+                (f"PIG#{item.get('pig_id')}", "text-body-2 text-no-wrap"),
+                (name[:46] + ("…" if len(name) > 46 else ""), "text-body-2"),
+                (str(item.get("dl") or "—"), "text-body-2 text-center"),
+                (f"TR#{item.get('tr_id')}" if item.get("tr_id") else "—",
+                 "text-body-2 text-center"),
+                (state_text, f"text-body-2 text-center text-{state_color}"),
+            ])
+
+        header_cells = [
+            ("#", "text-caption text-medium-emphasis"),
+            ("时间", "text-caption text-medium-emphasis"),
+            ("种子", "text-caption text-medium-emphasis"),
+            ("名称", "text-caption text-medium-emphasis"),
+            ("下载器", "text-caption text-center text-medium-emphasis"),
+            ("任务", "text-caption text-center text-medium-emphasis"),
+            ("状态", "text-caption text-center text-medium-emphasis"),
+        ]
+
+        table_content = [{
+            "component": "VTable",
+            "props": {"density": "comfortable"},
+            "content": [
+                {"component": "thead", "content": [
+                    {"component": "tr", "content": [
+                        {"component": "th", "props": {"class": c}, "text": t}
+                        for t, c in header_cells
+                    ]},
+                ]},
+                {"component": "tbody", "content": [
+                    {"component": "tr", "content": [
+                        {"component": "td", "props": {"class": c}, "text": t}
+                        for t, c in row
+                    ]}
+                    for row in rows
+                ]},
+            ],
+        }] if rows else [
+            {"component": "VAlert",
+             "props": {"type": "info", "variant": "tonal",
+                       "text": "还没有辅种记录，配置里打开「立即辅种一次」或等定时任务执行"}},
+        ]
+
+        page.append({
+            "component": "VRow",
+            "content": [{
+                "component": "VCol",
+                "props": {"cols": 12},
+                "content": [{
+                    "component": "VCard",
+                    "props": {"variant": "tonal"},
+                    "content": [
+                        {"component": "VCardTitle",
+                         "props": {"class": "d-flex align-center"},
+                         "content": [
+                             {"component": "VIcon",
+                              "props": {"color": "primary", "class": "mr-2"},
+                              "text": "mdi-history"},
+                             {"component": "span", "text": "最近辅种（最多 30 条）"},
+                         ]},
+                        {"component": "VCardText", "props": {"class": "pa-2"},
+                         "content": table_content},
+                    ],
+                }],
+            }],
+        })
+
+        def stat_cell(label: str, value: Any, color: str = "") -> dict:
+            cls = "text-subtitle-1 font-weight-bold" + (f" text-{color}" if color else "")
+            return {
+                "component": "VCol",
+                "props": {"cols": 6, "md": 3},
+                "content": [
+                    {"component": "div",
+                     "props": {"class": "text-caption text-medium-emphasis"}, "text": label},
+                    {"component": "div", "props": {"class": cls},
+                     "text": "—" if value is None else str(value)},
+                ],
+            }
+
+        detail = [
+            stat_cell("清单一致", stats.get("matched"), "success"),
+            stat_cell("本轮新增", stats.get("added"), "success"),
+            stat_cell("已收录跳过", stats.get("skipped")),
+            stat_cell("失败", stats.get("failed"), "error"),
+            stat_cell("站点做种清单", stats.get("site_seeding")),
+            stat_cell("据此跳过", stats.get("site_skipped")),
+            stat_cell("主下载器", "、".join(stats.get("sources") or []) or "自动"),
+            stat_cell("辅种下载器", stats.get("downloader") or "自动"),
+        ]
+
+        page.append({
+            "component": "VRow",
+            "content": [{
+                "component": "VCol",
+                "props": {"cols": 12},
+                "content": [{
+                    "component": "VCard",
+                    "props": {"variant": "tonal"},
+                    "content": [
+                        {"component": "VCardTitle",
+                         "props": {"class": "d-flex align-center"},
+                         "content": [
+                             {"component": "VIcon",
+                              "props": {"color": "info", "class": "mr-2"},
+                              "text": "mdi-chart-box"},
+                             {"component": "span", "text": "上轮运行统计"},
+                         ]},
+                        {"component": "VCardText",
+                         "content": [{"component": "VRow", "content": detail}]},
+                    ],
+                }],
+            }],
+        })
+
+        note = str(stats.get("message") or "")
+        page.append({
             "component": "VRow",
             "content": [{
                 "component": "VCol",
@@ -579,139 +593,18 @@ class Piggo(_PluginBase):
                 "content": [{
                     "component": "VAlert",
                     "props": {
-                        "type": "info",
+                        "type": "warning" if note else "info",
                         "variant": "tonal",
-                        "density": "compact",
-                        "title": title,
-                        "text": desc,
+                        "text": (note or
+                                 "索引优先走个人中心的实验室 API 增量刷新，没配令牌或 API 失败时回退前台列表；"
+                                 "签到功能已于 2.2 移除，站点风控无解，只能去网页日历手动签。"),
                     },
                 }],
             }],
-        }
+        })
 
-    @staticmethod
-    def __col(cols: int, component: dict) -> dict:
-        return {
-            "component": "VCol",
-            "props": {"cols": 12, "md": cols},
-            "content": [component],
-        }
+        return page
 
-    @staticmethod
-    def __switch(model: str, label: str) -> dict:
-        return {"component": "VSwitch", "props": {"model": model, "label": label}}
-
-    @staticmethod
-    def __field(model: str, label: str, field_type: str = "text") -> dict:
-        return {
-            "component": "VTextField",
-            "props": {"model": model, "label": label, "type": field_type},
-        }
-
-    # ------------------------------------------------------------------ 详情页
-    def get_page(self) -> List[dict]:
-        seed_stats = self.get_data(_SEED_STATS_KEY) or {}
-        seeded = self.get_data(_SEEDED_KEY) or {}
-        sign_stats = self.get_data(_SIGN_STATS_KEY) or {}
-
-        lines: List[str] = ["【索引】"]
-        if self._enabled:
-            lines.append(f"  已启用，索引 ID {self._site_id}，域名 {self._domain}")
-        else:
-            lines.append("  未启用")
-
-        lines.append("")
-        lines.append("【辅种】")
-        lines.append(
-            f"  主下载器：{self._seed_source_downloader or '全部 Transmission'}"
-            "（只扫描已完成种子）"
-        )
-        lines.append(
-            f"  辅种下载器：{self._seed_downloader or '自动选第一个 Transmission'}"
-            "（只新增辅种）"
-        )
-        if seed_stats:
-            lines.append(f"  上次运行：{seed_stats.get('finished_at', '-')}"
-                         f"，耗时 {seed_stats.get('elapsed', 0)} 秒")
-            lines.append(f"  索引 {seed_stats.get('index_total', 0)} 条，"
-                         f"本地已完成 {seed_stats.get('local_done', 0)} 个")
-            source = str(seed_stats.get("index_source") or "web")
-            lines.append(
-                f"  索引来源：{'实验室 API 增量' if source == 'api' else '前台列表'}，"
-                f"本轮刷新 {seed_stats.get('index_new', 0)} 条"
-            )
-            if seed_stats.get("site_seeding") is not None:
-                lines.append(
-                    f"  站点做种清单 {seed_stats.get('site_seeding', 0)} 个，"
-                    f"据此跳过 {seed_stats.get('site_skipped', 0)} 个"
-                )
-            lines.append(f"  体积命中 {seed_stats.get('hit', 0)}，"
-                         f"清单一致 {seed_stats.get('matched', 0)}，"
-                         f"新增 {seed_stats.get('added', 0)}，"
-                         f"已收录 {seed_stats.get('skipped', 0)}，"
-                         f"失败 {seed_stats.get('failed', 0)}")
-            if seed_stats.get("message"):
-                lines.append(f"  说明：{seed_stats['message']}")
-        else:
-            lines.append("  尚未运行")
-        seeding = sum(1 for v in seeded.values() if v.get("state") == "seeding")
-        nodata = sum(1 for v in seeded.values() if v.get("state") == "nodata")
-        verifying = len(seeded) - seeding - nodata
-        lines.append(
-            f"  已做种 {seeding} 个，校验中 {verifying} 个，无数据 {nodata} 个"
-        )
-
-        lines.append("")
-        lines.append("【签到】")
-        if sign_stats:
-            lines.append(f"  上次运行：{sign_stats.get('finished_at', '-')}")
-            lines.append(f"  结果：{sign_stats.get('message', '-')}")
-        else:
-            lines.append("  尚未运行")
-
-        recent = sorted(
-            seeded.values(), key=lambda x: x.get("at", ""), reverse=True
-        )[:10]
-        if recent:
-            lines.append("")
-            lines.append("最近辅种：")
-            for item in recent:
-                state = {
-                    "seeding": "做种",
-                    "nodata": "无数据",
-                }.get(str(item.get("state")), "校验中")
-                lines.append(
-                    f"  [{state}] {item.get('dl', '')} TR#{item.get('tr_id')} "
-                    f"PIG#{item.get('pig_id')} {str(item.get('name', ''))[:48]}"
-                )
-
-        return [
-            {
-                "component": "VForm",
-                "content": [
-                    {
-                        "component": "VRow",
-                        "content": [{
-                            "component": "VCol",
-                            "props": {"cols": 12},
-                            "content": [{
-                                "component": "VCard",
-                                "props": {"variant": "tonal"},
-                                "content": [{
-                                    "component": "VCardText",
-                                    "props": {
-                                        "style": "white-space: pre-wrap;"
-                                                 "font-family: monospace;"
-                                                 "line-height: 1.7;",
-                                    },
-                                    "text": "\n".join(lines),
-                                }],
-                            }],
-                        }],
-                    }
-                ],
-            }
-        ]
 
     # ------------------------------------------------------------------ API
     def get_api(self) -> List[Dict[str, Any]]:
@@ -722,13 +615,6 @@ class Piggo(_PluginBase):
                 "methods": ["POST"],
                 "auth": "apikey",
                 "summary": "立即执行辅种",
-            },
-            {
-                "path": "/sign",
-                "endpoint": self.api_sign,
-                "methods": ["POST"],
-                "auth": "apikey",
-                "summary": "立即执行签到",
             },
             {
                 "path": "/status",
@@ -745,80 +631,13 @@ class Piggo(_PluginBase):
         threading.Thread(target=self.run_seed_task, daemon=True).start()
         return {"success": True, "message": "已启动辅种"}
 
-    async def api_sign(self) -> dict:
-        threading.Thread(target=self.run_sign_task, daemon=True).start()
-        return {"success": True, "message": "已启动签到"}
-
     async def api_status(self) -> dict:
         return {
             "success": True,
             "seed_running": self._seed_running,
             "seed_stats": self.get_data(_SEED_STATS_KEY) or {},
             "seeded": len(self.get_data(_SEEDED_KEY) or {}),
-            "sign_stats": self.get_data(_SIGN_STATS_KEY) or {},
         }
-
-    # ------------------------------------------------------------------ 签到
-    def run_sign_task(self) -> None:
-        if not self._sign_enabled:
-            logger.info("猪猪签到：未启用，跳过")
-            return
-        client = None
-        message = ""
-        success = False
-        try:
-            client = self.__client()
-            client.login()
-            success, message = client.sign_in(self.__captcha_solver())
-            log = logger.info if success else logger.warning
-            log(f"猪猪签到：{message}")
-        except PiggoError as err:
-            message = f"站点交互失败：{err}"
-            logger.error(f"猪猪签到：{message}")
-        except Exception as err:  # noqa: BLE001
-            message = f"异常：{err}"
-            logger.exception(f"猪猪签到：{message}")
-        finally:
-            if client is not None:
-                client.close()
-            self.save_data(_SIGN_STATS_KEY, {
-                "finished_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                "success": success,
-                "message": message,
-            })
-            if self._sign_notify:
-                try:
-                    self.post_message(
-                        mtype=NotificationType.Plugin,
-                        title="【猪猪签到】" + ("成功" if success else "未完成"),
-                        text=message,
-                    )
-                except Exception as err:  # noqa: BLE001
-                    logger.warning(f"猪猪签到：发送通知失败 {err}")
-
-    def __captcha_solver(self) -> Optional[Callable[[bytes], str]]:
-        """图片验证码识别。ddddocr 缺失时返回 None，签到降级为提示人工。"""
-        if not self._sign_captcha:
-            return None
-        if self._ocr is None:
-            try:
-                # ddddocr 装在 /config 下而非镜像里，容器重建不会丢；
-                # 需要手工把这个目录挂到 sys.path 上。
-                packages = "/config/py_packages"
-                if os.path.isdir(packages) and packages not in sys.path:
-                    sys.path.insert(0, packages)
-                import ddddocr  # noqa: PLC0415
-
-                self._ocr = ddddocr.DdddOcr(show_ad=False)
-                logger.info("猪猪签到：验证码识别器已加载")
-            except Exception as err:  # noqa: BLE001
-                logger.warning(
-                    f"猪猪签到：ddddocr 不可用（{err}），"
-                    f"签到遇验证码将提示人工处理"
-                )
-                return None
-        ocr = self._ocr
-        return lambda image: ocr.classification(image)
 
     # ------------------------------------------------------------------ 辅种主流程
     def run_seed_task(self) -> None:
@@ -1322,11 +1141,6 @@ class Piggo(_PluginBase):
             "seed_onlyonce": False,
             "seed_search": self._seed_search,
             "seed_search_limit": self._seed_search_limit,
-            "sign_enabled": self._sign_enabled,
-            "sign_cron": self._sign_cron,
-            "sign_notify": self._sign_notify,
-            "sign_captcha": self._sign_captcha,
-            "sign_onlyonce": False,
         })
 
     @property
