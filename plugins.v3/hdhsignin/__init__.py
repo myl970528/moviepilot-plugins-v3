@@ -45,7 +45,7 @@ class HdhSignIn(_PluginBase):
     # 插件图标
     plugin_icon = "signin.png"
     # 插件版本
-    plugin_version = "1.0"
+    plugin_version = "1.1"
     # 插件作者
     plugin_author = "hermes"
     # 作者主页
@@ -187,9 +187,11 @@ class HdhSignIn(_PluginBase):
                 hint = "登录失败（账号或密码错误，或站点新增了校验）"
             return False, f"{hint}：{str(me)[:160]}", {"url": home}
 
-        points = me.get("points")
-        level = str((me.get("level") or {}).get("name") or "")
-        nickname = str(me.get("nickname") or me.get("id") or "")
+        # 站点统一返回 {"success": true, "data": {...}}，账户字段在 data 里
+        info = me.get("data") if isinstance(me.get("data"), dict) else me
+        points = info.get("points")
+        level = str((info.get("level") or {}).get("name") or "")
+        nickname = str(info.get("nickname") or info.get("id") or "")
 
         ci_status, ci = _split_response(ci_raw)
         if ci_status == 409:

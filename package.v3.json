@@ -47,13 +47,14 @@
     "name": "栖影签到",
     "description": "栖影 HDHaven 每日自动签到。站点登录强制 Cloudflare Turnstile 且会话绑定出口 IP，插件用 Browserless 的 BrowserQL 在同一浏览器会话内解验证、登录并调用签到接口，不保存 Cookie。",
     "labels": "站点,签到",
-    "version": "1.0",
+    "version": "1.1",
     "icon": "",
     "author": "hermes",
     "level": 2,
     "release": false,
     "system_version": ">=3.0.0",
     "history": {
+      "v1.1": "修正账户字段取值：/me 的积分、等级、昵称在 data 里，签到记录与通知现在能带上当前积分。",
       "v1.0": "首个发布版本：BrowserQL 一次 mutation 完成 goto /solve/填表/登录/读账户/签到，409 视为今日已签；支持立即执行与手动接口。"
     }
   }
