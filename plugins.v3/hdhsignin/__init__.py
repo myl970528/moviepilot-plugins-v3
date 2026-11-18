@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""栖影 HDHaven 每日签到。
+"""栖影 HDHaven 每日签到 - 普通签 / 赌狗签
 
 站点是 Next.js 自研站，登录接口 POST /api/auth/login 要求携带 Cloudflare
 Turnstile 令牌，且会话与出口 IP、设备指纹绑定。机房 IP 环境下 Turnstile 一律
@@ -11,41 +11,49 @@ Turnstile 令牌，且会话与出口 IP、设备指纹绑定。机房 IP 环境
 
 BrowserQL 一次 mutation 完成的动作：
   goto /login → solve(type: cloudflare) → 填账号密码 → 点登录 → 等跳转
-  → fetch /api/auth/me → fetch POST /api/account/checkin
+  → fetch /api/auth/me → fetch POST /api/account/checkin（或 /checkin/gamble）
+
+两种签到每天只能二选一（站点前端按钮按 checkin_today 互斥）：
+  普通签  POST /api/account/checkin        固定积分 + 经验
+  赌狗签  POST /api/account/checkin/gamble 按档位随机倍数，可能为负，扣到 0 为止，不加经验
 """
 from __future__ import annotations
 
 import json
+import threading
+import time
 import traceback
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
+import requests
 from apscheduler.triggers.cron import CronTrigger
 
 from app import schemas
 from app.log import logger
 from app.plugins import _PluginBase
 
-import requests
-
 _DEFAULT_BROWSERLESS_URL = "https://production-sfo.browserless.io"
 _DEFAULT_CRON = "20 8 * * *"
 
-# 站点固定的 Turnstile sitekey，登录页由 JS 动态注入，不能从 HTML 里取
-_SITEKEY = "0x4AAAAAAE6M3XfI3JzwDd99"
 _LOGIN_URL = "https://hdhaven.com/login"
-_HOME_URL = "https://hdhaven.com/"
+_API_ME = "/api/auth/me"
+_API_CHECKIN = "/api/account/checkin"
+_API_GAMBLE = "/api/account/checkin/gamble"
+
+_RECORDS_KEY = "hdh_records"
+_RECORDS_LIMIT = 500
 
 
 class HdhSignIn(_PluginBase):
     # 插件名称
     plugin_name = "栖影签到"
     # 插件描述
-    plugin_desc = "栖影 HDHaven 每日自动签到，用 Browserless 解 Turnstile 后在同一会话内签到。"
+    plugin_desc = "栖影 HDHaven 每日自动签到 · 普通签/赌狗签模式 · Browserless 解 Turnstile · 积分与签到记录 · 结果通知 · 失败重试"
     # 插件图标
     plugin_icon = "signin.png"
     # 插件版本
-    plugin_version = "1.1"
+    plugin_version = "1.2"
     # 插件作者
     plugin_author = "hermes"
     # 作者主页
@@ -57,6 +65,20 @@ class HdhSignIn(_PluginBase):
     # 可使用的用户级别
     auth_level = 2
 
+    # ======================== 常量 ========================
+
+    SIGN_MODE_NORMAL = "normal"
+    SIGN_MODE_GAMBLE = "gamble"
+
+    # 站点 /api/auth/me 返回的档位表（后台可调，这里只做兜底展示）
+    GAMBLE_TIERS = {
+        "暴富": 4.0,
+        "小赚": 1.5,
+        "不亏": 1.0,
+        "白签": 0.0,
+        "血亏": -1.0,
+    }
+
     # ---- 配置
     _enabled: bool = False
     _notify: bool = True
@@ -64,11 +86,10 @@ class HdhSignIn(_PluginBase):
     _password: str = ""
     _browserless_url: str = _DEFAULT_BROWSERLESS_URL
     _browserless_token: str = ""
+    _lucky_mode: bool = False
     _cron: str = _DEFAULT_CRON
+    _retry: int = 2
     _onlyonce: bool = False
-
-    _HISTORY_KEY = "history"
-    _HISTORY_LIMIT = 30
 
     # ------------------------------------------------------------------ 生命周期
     def init_plugin(self, config: Optional[dict] = None) -> None:
@@ -80,25 +101,49 @@ class HdhSignIn(_PluginBase):
             url = str(config.get("browserless_url") or "").strip().rstrip("/")
             self._browserless_url = url or _DEFAULT_BROWSERLESS_URL
             self._browserless_token = str(config.get("browserless_token") or "").strip()
+            self._lucky_mode = bool(config.get("lucky_mode"))
             self._cron = str(config.get("cron") or _DEFAULT_CRON).strip()
+            retry = config.get("retry")
+            self._retry = 2 if retry is None else max(int(retry), 0)
             self._onlyonce = bool(config.get("onlyonce"))
 
         if self._onlyonce:
             self._onlyonce = False
-            self._save_config()
+            self.__update_config()
             logger.info("栖影签到：收到立即执行指令，15 秒后开始")
-            import threading
             threading.Timer(15, self.run_task).start()
 
+    def __update_config(self) -> None:
+        self.update_config({
+            "enabled": self._enabled,
+            "notify": self._notify,
+            "username": self._username,
+            "password": self._password,
+            "browserless_url": self._browserless_url,
+            "browserless_token": self._browserless_token,
+            "lucky_mode": self._lucky_mode,
+            "cron": self._cron,
+            "retry": self._retry,
+            "onlyonce": False,
+        })
+
+    @property
+    def _mode(self) -> str:
+        return self.SIGN_MODE_GAMBLE if self._lucky_mode else self.SIGN_MODE_NORMAL
+
+    @property
+    def _mode_label(self) -> str:
+        return "赌狗签" if self._mode == self.SIGN_MODE_GAMBLE else "普通签"
+
     def get_state(self) -> bool:
-        return bool(self._enabled)
+        return bool(self._enabled and self._username and self._browserless_token)
 
     def stop_service(self) -> None:
         pass
 
     # ------------------------------------------------------------------ 调度
     def get_service(self) -> List[Dict[str, Any]]:
-        if not self._enabled or not self._cron:
+        if not self.get_state() or not self._cron:
             return []
         try:
             if self._cron.count(" ") != 4:
@@ -132,51 +177,69 @@ class HdhSignIn(_PluginBase):
 
     # ------------------------------------------------------------------ 业务
     def run_task(self) -> Tuple[bool, str]:
-        try:
-            ok, msg, extra = self._signin()
-        except Exception as err:  # noqa: BLE001
-            logger.error(f"栖影签到：执行异常 {err}\n{traceback.format_exc()}")
-            ok, msg, extra = False, f"执行异常：{err}", {}
+        """定时 / 手动签到入口，带失败重试。"""
+        if not self._username or not self._password:
+            return self._fail("未配置账号或密码")
+        if not self._browserless_token:
+            return self._fail("未配置 Browserless 令牌")
 
-        record = {
-            "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "ok": bool(ok),
-            "msg": msg,
-        }
-        record.update({k: v for k, v in (extra or {}).items() if v not in (None, "")})
-        self._append_history(record)
+        logger.info(f"栖影签到开始，模式：{self._mode_label}")
+        max_retry = max(int(self._retry or 0), 0)
+        result: Dict[str, Any] = {}
 
+        for attempt in range(max_retry + 1):
+            try:
+                result = self._do_sign()
+            except Exception as err:  # noqa: BLE001
+                logger.error(f"栖影签到：执行异常 {err}\n{traceback.format_exc()}")
+                result = {"ok": False, "msg": f"执行异常：{err}"}
+
+            if result.get("ok"):
+                break
+
+            msg = str(result.get("msg") or "")
+            # 账号密码错、被风控这类重试也没用，直接停
+            if any(k in msg for k in ("账号或密码", "人机验证", "未配置", "登录失败")):
+                break
+            if attempt < max_retry:
+                logger.warning(f"栖影签到第 {attempt + 1} 次失败：{msg}，60 秒后重试")
+                time.sleep(60)
+
+        ok = bool(result.get("ok"))
+        msg = str(result.get("msg") or "")
         if ok:
             logger.info(f"栖影签到：{msg}")
         else:
-            logger.error(f"栖影签到：{msg}")
+            logger.error(f"栖影签到最终失败：{msg}")
 
-        if self._notify and (not ok or extra.get("changed")):
-            try:
-                self.post_message(title="【栖影签到】",
-                                  text=msg if ok else f"签到失败：{msg}")
-            except Exception as err:  # noqa: BLE001
-                logger.error(f"栖影签到：发送通知失败 {err}")
+        self._append_record(result)
+        if self._notify:
+            self._send_notify(result)
         return ok, msg
 
-    def _signin(self) -> Tuple[bool, str, Dict[str, Any]]:
-        if not self._username or not self._password:
-            return False, "未配置账号或密码", {}
-        if not self._browserless_token:
-            return False, "未配置 Browserless 令牌", {}
+    def _fail(self, msg: str) -> Tuple[bool, str]:
+        logger.error(f"栖影签到：{msg}")
+        return False, msg
+
+    def _do_sign(self) -> Dict[str, Any]:
+        """执行一次签到，返回统一结构的结果字典。"""
+        today = datetime.now().strftime("%Y-%m-%d")
+        now_time = datetime.now().strftime("%H:%M:%S")
+        mode = self._mode
 
         result = self._bql(self._build_query())
         data = result.get("data") or {}
         if result.get("errors"):
             err = "; ".join(str(e.get("message") or "") for e in result["errors"])
-            return False, f"BrowserQL 返回错误：{err[:200]}", {}
+            return {"ok": False, "msg": f"BrowserQL 返回错误：{err[:200]}",
+                    "date": today, "time": now_time, "mode": mode}
 
         solve = data.get("solve") or {}
         if not solve.get("solved"):
-            return False, ("人机验证未通过（Browserless 解 Turnstile 失败），"
-                           "稍后重试或更换 Browserless 区域端点"), {}
+            return {"ok": False, "msg": "人机验证未通过（Browserless 解 Turnstile 失败），"
+                                        "稍后重试或更换 Browserless 区域端点",
+                    "date": today, "time": now_time, "mode": mode}
 
-        home = str((data.get("u2") or {}).get("value") or "")
         me_raw = str((data.get("m2") or {}).get("value") or "")
         ci_raw = str((data.get("k2") or {}).get("value") or "")
 
@@ -185,34 +248,73 @@ class HdhSignIn(_PluginBase):
             hint = "登录失败"
             if me_status == 401:
                 hint = "登录失败（账号或密码错误，或站点新增了校验）"
-            return False, f"{hint}：{str(me)[:160]}", {"url": home}
+            return {"ok": False, "msg": f"{hint}：{str(me)[:160]}",
+                    "date": today, "time": now_time, "mode": mode}
 
         # 站点统一返回 {"success": true, "data": {...}}，账户字段在 data 里
         info = me.get("data") if isinstance(me.get("data"), dict) else me
         points = info.get("points")
         level = str((info.get("level") or {}).get("name") or "")
         nickname = str(info.get("nickname") or info.get("id") or "")
+        reward_base = info.get("checkin_reward")
+        checkin_today = bool(info.get("checkin_today"))
 
         ci_status, ci = _split_response(ci_raw)
-        if ci_status == 409:
-            msg = _already_text(ci, points, level)
-            return True, msg, {"points": points, "level": level, "changed": False}
+        inner = ci.get("data") if isinstance(ci.get("data"), dict) else ci
+        if not isinstance(inner, dict):
+            inner = {}
+
+        if ci_status == 409 or checkin_today:
+            streak = _to_int(inner.get("checkin_streak"))
+            return {
+                "ok": True, "already": True, "msg": _already_text(ci, points, level),
+                "date": today, "time": now_time, "mode": mode, "tier": "",
+                "award": 0, "balance": points, "streak": streak,
+                "level": level, "nickname": nickname,
+            }
+
         if ci_status == 200:
-            gained = None
-            if isinstance(ci, dict):
-                inner = ci.get("data") if isinstance(ci.get("data"), dict) else ci
-                for key in ("points", "gain", "reward", "bonus"):
-                    if isinstance(inner.get(key), (int, float)):
-                        gained = inner.get(key)
-                        break
-            if gained:
-                msg = f"签到成功，获得 {gained} 积分（当前 {points}）"
+            earned = _to_int(inner.get("earned"))
+            balance = inner.get("points", points)
+            streak = _to_int(inner.get("checkin_streak"))
+            outcome = str(inner.get("outcome") or "")
+            exp = _to_int(inner.get("experience_earned"))
+
+            if mode == self.SIGN_MODE_GAMBLE:
+                if outcome:
+                    tail = (f"获得 {earned}" if earned and earned > 0
+                            else (f"扣除 {-earned}" if earned and earned < 0 else "没有获得"))
+                    msg = f"赌狗签到「{outcome}」：{tail} 积分"
+                elif earned:
+                    msg = f"赌狗签到：{'获得' if earned > 0 else '扣除'} {abs(earned)} 积分"
+                else:
+                    msg = "赌狗签到：没有获得积分"
             else:
-                msg = f"签到成功（当前 {points} 积分）"
+                if earned:
+                    msg = f"签到成功，获得 {earned} 积分"
+                elif reward_base:
+                    msg = f"签到成功，获得 {reward_base} 积分"
+                else:
+                    msg = "签到成功"
+                if exp:
+                    msg += f"、{exp} 经验"
+            if streak:
+                msg += f"，连续签到 {streak} 天"
+            if balance is not None:
+                msg += f"（当前 {balance} 积分"
+                msg += f"，{level}）" if level else "）"
             if nickname:
                 msg = f"{nickname} {msg}"
-            return True, msg, {"points": points, "level": level, "changed": True}
-        return False, f"签到接口返回 {ci_status}：{str(ci)[:160]}", {"points": points}
+
+            return {
+                "ok": True, "already": False, "msg": msg,
+                "date": today, "time": now_time, "mode": mode,
+                "tier": outcome, "award": earned or 0, "balance": balance,
+                "streak": streak, "level": level, "nickname": nickname,
+            }
+
+        return {"ok": False, "msg": f"签到接口返回 {ci_status}：{str(ci)[:160]}",
+                "date": today, "time": now_time, "mode": mode, "balance": points}
 
     # ------------------------------------------------------------------ BrowserQL
     def _build_query(self) -> str:
@@ -229,17 +331,27 @@ class HdhSignIn(_PluginBase):
                   "if(!b)return 'no-btn';b.click();return 'clicked';})()")
         start_me = (
             "(()=>{window.__hdme='pending';"
-            "fetch('/api/auth/me',{credentials:'include',headers:{Accept:'application/json'}})"
+            "fetch('%s',{credentials:'include',headers:{Accept:'application/json'}})"
             ".then(r=>r.text().then(t=>window.__hdme=r.status+' '+t))"
-            ".catch(e=>{window.__hdme='0 '+e});return 'ok';})()"
+            ".catch(e=>{window.__hdme='0 '+e});return 'ok';})()" % _API_ME
         )
-        start_ci = (
-            "(()=>{window.__hdci='pending';"
-            "fetch('/api/account/checkin',{method:'POST',credentials:'include',"
-            "headers:{'Content-Type':'application/json',Accept:'application/json'},body:'{}'})"
-            ".then(r=>r.text().then(t=>window.__hdci=r.status+' '+t))"
-            ".catch(e=>{window.__hdci='0 '+e});return 'ok';})()"
-        )
+        if self._mode == self.SIGN_MODE_GAMBLE:
+            # 赌狗签不带 body，前端就是 fetch(url, {method:'POST'})
+            start_ci = (
+                "(()=>{window.__hdci='pending';"
+                "fetch('%s',{method:'POST',credentials:'include',"
+                "headers:{Accept:'application/json'}})"
+                ".then(r=>r.text().then(t=>window.__hdci=r.status+' '+t))"
+                ".catch(e=>{window.__hdci='0 '+e});return 'ok';})()" % _API_GAMBLE
+            )
+        else:
+            start_ci = (
+                "(()=>{window.__hdci='pending';"
+                "fetch('%s',{method:'POST',credentials:'include',"
+                "headers:{'Content-Type':'application/json',Accept:'application/json'},body:'{}'})"
+                ".then(r=>r.text().then(t=>window.__hdci=r.status+' '+t))"
+                ".catch(e=>{window.__hdci='0 '+e});return 'ok';})()" % _API_CHECKIN
+            )
         return (
             "mutation Sign {\n"
             '  goto(url: "%s", waitUntil: networkIdle) { status }\n'
@@ -253,7 +365,6 @@ class HdhSignIn(_PluginBase):
             "  k1: evaluate(content: %s) { value }\n"
             "  w3: waitForTimeout(time: 5000) { time }\n"
             '  k2: evaluate(content: "window.__hdci||\\"\\"") { value }\n'
-            '  u2: evaluate(content: "location.href") { value }\n'
             "}"
         ) % (_LOGIN_URL, json.dumps(fill), json.dumps(submit),
              json.dumps(start_me), json.dumps(start_ci))
@@ -276,173 +387,292 @@ class HdhSignIn(_PluginBase):
         except Exception:  # noqa: BLE001
             return {"errors": [{"message": "Browserless 返回内容无法解析"}]}
 
-    # ------------------------------------------------------------------ 记录
-    def _append_history(self, record: Dict[str, Any]) -> None:
-        history = self.get_data(self._HISTORY_KEY) or []
-        if not isinstance(history, list):
-            history = []
-        history.insert(0, record)
-        self.save_data(self._HISTORY_KEY, history[: self._HISTORY_LIMIT])
+    # ------------------------------------------------------------------ 通知
+    def _send_notify(self, result: Dict[str, Any]) -> None:
+        if not result:
+            return
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        mode_label = "赌狗签" if result.get("mode") == self.SIGN_MODE_GAMBLE else "普通签"
 
-    def _save_config(self) -> None:
-        self.update_config({
-            "enabled": self._enabled,
-            "notify": self._notify,
-            "username": self._username,
-            "password": self._password,
-            "browserless_url": self._browserless_url,
-            "browserless_token": self._browserless_token,
-            "cron": self._cron,
-            "onlyonce": False,
+        if not result.get("ok"):
+            title = "【栖影签到】失败"
+            text = "\n".join([
+                "栖影签到失败",
+                "",
+                f"原因：{result.get('msg') or '未知错误'}",
+                f"模式：{mode_label}",
+                "",
+                f"{now}",
+            ])
+        elif result.get("already"):
+            title = "【栖影签到】今日已签到"
+            text = "\n".join([
+                "栖影今日已签到",
+                "",
+                f"积分：{_fmt(result.get('balance'))}",
+                f"最近签到：{result.get('date') or '—'}",
+                "",
+                f"{now}",
+            ])
+        else:
+            award = _to_int(result.get("award")) or 0
+            tier = str(result.get("tier") or "")
+            if result.get("mode") == self.SIGN_MODE_GAMBLE:
+                title = "【栖影签到】" + (f"赌狗签 {tier}" if tier else "赌狗签完成")
+                head = f"赌狗签{f'「{tier}」' if tier else ''}"
+            else:
+                title = "【栖影签到】成功"
+                head = "普通签"
+            text = "\n".join([
+                f"栖影{head}完成",
+                "",
+                f"本次积分：{'+' if award > 0 else ''}{award}",
+                f"当前余额：{_fmt(result.get('balance'))}",
+                f"连续签到：{_fmt(result.get('streak'), ' 天')}",
+                "",
+                f"{now}",
+            ])
+
+        try:
+            self.post_message(title=title, text=text)
+        except Exception as err:  # noqa: BLE001
+            logger.error(f"栖影签到：发送通知失败 {err}")
+
+    # ------------------------------------------------------------------ 记录
+    def _load_records(self) -> List[Dict[str, Any]]:
+        data = self.get_data(_RECORDS_KEY) or []
+        if not isinstance(data, list):
+            data = []
+        if not self.get_data("migrated_v12"):
+            data = self._migrate_legacy(data)
+        return data
+
+    def _migrate_legacy(self, current: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """把 1.1 及以前存在 history 键里的老记录换算成新结构，只做一次。"""
+        legacy = self.get_data("history") or []
+        merged = list(current)
+        seen = {str(r.get("date")) for r in merged if isinstance(r, dict)}
+        added = 0
+        for item in legacy if isinstance(legacy, list) else []:
+            if not isinstance(item, dict):
+                continue
+            stamp = str(item.get("time") or "")
+            if not stamp or stamp[:10] in seen:
+                continue
+            merged.append({
+                "date": stamp[:10],
+                "time": stamp[11:19],
+                "success": bool(item.get("ok")),
+                "already": bool(item.get("ok")) and not item.get("changed", True),
+                "mode": self.SIGN_MODE_NORMAL,
+                "tier": "",
+                "award": 0,
+                "balance": item.get("points"),
+                "streak": None,
+                "level": item.get("level") or "",
+                "nickname": "",
+                "msg": str(item.get("msg") or ""),
+            })
+            seen.add(stamp[:10])
+            added += 1
+        merged.sort(key=lambda r: str(r.get("date")))
+        merged = merged[-_RECORDS_LIMIT:]
+        try:
+            self.save_data(_RECORDS_KEY, merged)
+            self.save_data("migrated_v12", True)
+            if added:
+                logger.info(f"栖影签到：已把 {added} 条老记录迁移到新结构")
+        except Exception as err:  # noqa: BLE001
+            logger.error(f"栖影签到：迁移老记录失败 {err}")
+        return merged
+
+    def _append_record(self, result: Dict[str, Any]) -> None:
+        if not isinstance(result, dict) or not result.get("date"):
+            return
+        records = [r for r in self._load_records()
+                   if str(r.get("date")) != str(result.get("date"))]
+        records.append({
+            "date": result.get("date"),
+            "time": result.get("time"),
+            "success": bool(result.get("ok")),
+            "already": bool(result.get("already")),
+            "mode": result.get("mode") or self.SIGN_MODE_NORMAL,
+            "tier": result.get("tier") or "",
+            "award": _to_int(result.get("award")) or 0,
+            "balance": result.get("balance"),
+            "streak": result.get("streak"),
+            "level": result.get("level") or "",
+            "nickname": result.get("nickname") or "",
+            "msg": result.get("msg") or "",
         })
+        records = records[-_RECORDS_LIMIT:]
+        try:
+            self.save_data(_RECORDS_KEY, records)
+        except Exception as err:  # noqa: BLE001
+            logger.error(f"栖影签到：保存记录失败 {err}")
 
     # ------------------------------------------------------------------ 页面
-    def get_form(self) -> Tuple[List[dict], Dict[str, Any]]:
-        return [
-            {
-                "component": "VForm",
-                "content": [
-                    {
-                        "component": "VRow",
-                        "content": [
-                            self._col(4, {"component": "VSwitch",
-                                          "props": {"model": "enabled", "label": "启用插件"}}),
-                            self._col(4, {"component": "VSwitch",
-                                          "props": {"model": "notify", "label": "发送通知"}}),
-                            self._col(4, {"component": "VSwitch",
-                                          "props": {"model": "onlyonce", "label": "立即签到一次"}}),
-                        ],
-                    },
-                    {
-                        "component": "VRow",
-                        "content": [
-                            self._col(6, {"component": "VTextField",
-                                          "props": {"model": "username", "label": "站点账号"}}),
-                            self._col(6, {"component": "VTextField",
-                                          "props": {"model": "password", "label": "站点密码",
-                                                    "type": "password"}}),
-                        ],
-                    },
-                    {
-                        "component": "VRow",
-                        "content": [
-                            self._col(6, {"component": "VTextField",
-                                          "props": {"model": "browserless_url",
-                                                    "label": "Browserless 地址",
-                                                    "placeholder": _DEFAULT_BROWSERLESS_URL}}),
-                            self._col(6, {"component": "VCronField",
-                                          "props": {"model": "cron", "label": "执行周期",
-                                                    "placeholder": "5位cron表达式，如 20 8 * * *"}}),
-                        ],
-                    },
-                    {
-                        "component": "VRow",
-                        "content": [
-                            self._col(12, {"component": "VTextField",
-                                           "props": {"model": "browserless_token",
-                                                     "label": "Browserless 令牌",
-                                                     "type": "password"}}),
-                        ],
-                    },
-                    {
-                        "component": "VRow",
-                        "content": [{
-                            "component": "VCol",
-                            "props": {"cols": 12},
-                            "content": [{
-                                "component": "VAlert",
-                                "props": {
-                                    "type": "info",
-                                    "variant": "tonal",
-                                    "text": "栖影登录强制 Cloudflare Turnstile，且会话绑定出口 IP 与设备指纹，"
-                                            "机房 IP 直连一律卡在「正在验证」。本插件用 Browserless 的 "
-                                            "BrowserQL 在其浏览器内解验证、登录并直接调用签到接口，"
-                                            "不保存 Cookie，每次运行都是独立会话。令牌与「PT站点签到」"
-                                            "插件共用同一份即可。",
-                                },
-                            }],
-                        }],
-                    },
-                ],
-            }
-        ], {
-            "enabled": False,
-            "notify": True,
-            "onlyonce": False,
-            "username": "",
-            "password": "",
-            "browserless_url": _DEFAULT_BROWSERLESS_URL,
-            "browserless_token": "",
-            "cron": _DEFAULT_CRON,
-        }
-
     def get_page(self) -> List[dict]:
-        history = self.get_data(self._HISTORY_KEY) or []
-        if not isinstance(history, list):
-            history = []
-        rows = []
-        for record in history[:15]:
-            rows.append({
-                "component": "tr",
-                "content": [
-                    {"component": "td", "props": {"class": "text-sm"},
-                     "text": str(record.get("time", ""))},
-                    {"component": "td", "props": {"class": "text-sm"},
-                     "text": "成功" if record.get("ok") else "失败"},
-                    {"component": "td", "props": {"class": "text-sm"},
-                     "text": str(record.get("msg", ""))},
-                ],
-            })
-        if not rows:
-            rows.append({
-                "component": "tr",
-                "content": [{
-                    "component": "td",
-                    "props": {"colspan": 3, "class": "text-sm text-medium-emphasis"},
-                    "text": "还没有执行过，可以点插件页面上的「立即签到一次」或调用 /run 接口",
-                }],
-            })
+        """统计页面：账号 KPI + 最近签到记录（数据取自最近一次签到，不额外消耗 Browserless）。"""
+        records = self._load_records()
+        items = sorted([r for r in records if isinstance(r, dict)],
+                       key=lambda r: str(r.get("date")), reverse=True)
+        latest = items[0] if items else {}
 
-        last = history[0] if history else {}
-        summary = "暂无记录"
-        if last:
-            summary = (f"{last.get('time', '')}　{'成功' if last.get('ok') else '失败'}　"
-                       f"{last.get('msg', '')}")
-        return [{
+        total_award = sum(_to_int(r.get("award")) or 0 for r in items)
+        success_days = len({r.get("date") for r in items if r.get("success")})
+        nickname = str(latest.get("nickname") or "") or "未获取"
+        level = str(latest.get("level") or "") or "—"
+        balance = latest.get("balance")
+
+        def kpi(icon: str, label: str, value: str, color: str = "", note: str = "") -> dict:
+            value_cls = f"text-h6 font-weight-bold text-{color}" if color else "text-h6 font-weight-bold"
+            children = [
+                {"component": "VIcon",
+                 "props": {"color": color or "primary", "size": "28", "class": "mb-1"},
+                 "text": icon},
+                {"component": "span", "props": {
+                    "class": value_cls,
+                    "style": "display:block; font-size: clamp(0.8rem, 3.8vw, 1.25rem);"
+                             " white-space: normal; overflow-wrap: anywhere;"
+                             " word-break: break-all; line-height: 1.2;",
+                }, "text": value},
+                {"component": "span",
+                 "props": {"class": "text-caption text-medium-emphasis d-block mt-1"},
+                 "text": label},
+            ]
+            if note:
+                children.append({"component": "div",
+                                 "props": {"class": "text-caption text-medium-emphasis"},
+                                 "text": note})
+            return {
+                "component": "VCard",
+                "props": {"variant": "tonal", "class": "h-100"},
+                "content": [{"component": "VCardText",
+                             "props": {"class": "text-center pa-3"}, "content": children}],
+            }
+
+        last_text = "—"
+        if latest.get("date"):
+            last_text = f"{latest.get('date')} {str(latest.get('time') or '')}".strip()
+
+        kpis = [
+            ("mdi-account", "账号", nickname, "primary", f"等级：{level}"),
+            ("mdi-coins", "当前积分", _fmt(balance), "info", "来自最近一次签到"),
+            ("mdi-gift", "累计获得", f"{total_award:,}", "warning",
+             f"本地记录 {success_days} 天"),
+            ("mdi-calendar-check", "最近签到", last_text, "success",
+             "赌狗签" if latest.get("mode") == self.SIGN_MODE_GAMBLE else "普通签"),
+        ]
+
+        page: List[dict] = [{
+            "component": "VRow",
+            "props": {"dense": True},
+            "content": [
+                {"component": "VCol", "props": {"cols": 6, "md": 6}, "content": [kpi(*kpis[0])]},
+                {"component": "VCol", "props": {"cols": 6, "md": 6}, "content": [kpi(*kpis[1])]},
+                {"component": "VCol", "props": {"cols": 6, "md": 6}, "content": [kpi(*kpis[2])]},
+                {"component": "VCol", "props": {"cols": 6, "md": 6}, "content": [kpi(*kpis[3])]},
+            ],
+        }]
+
+        rows = []
+        for idx, r in enumerate(items[:30], start=1):
+            ok = bool(r.get("success"))
+            already = bool(r.get("already"))
+            status = "已签到" if already else ("成功" if ok else "失败")
+            status_color = "success" if (ok and not already) else ("info" if already else "error")
+            mode = "赌狗签" if r.get("mode") == self.SIGN_MODE_GAMBLE else "普通签"
+            tier = str(r.get("tier") or "")
+            award = _to_int(r.get("award")) or 0
+            award_text = f"{'+' if award > 0 else ''}{award}"
+            rows.append([
+                (str(idx), "text-body-2 text-medium-emphasis"),
+                (str(r.get("date") or "—"), "text-body-2"),
+                (str(r.get("time") or ""), "text-body-2 text-center"),
+                (mode + (f" · {tier}" if tier else ""), "text-body-2 text-center"),
+                (award_text, "text-body-2 font-weight-bold text-center text-"
+                             + ("success" if award > 0 else ("error" if award < 0 else "medium-emphasis"))),
+                (str(r.get("balance") if r.get("balance") is not None else "—"),
+                 "text-body-2 text-center"),
+                (status, f"text-body-2 text-center text-{status_color}"),
+            ])
+
+        header_cells = [
+            ("#", "text-caption text-medium-emphasis"),
+            ("日期", "text-caption text-medium-emphasis"),
+            ("时间", "text-caption text-center text-medium-emphasis"),
+            ("模式", "text-caption text-center text-medium-emphasis"),
+            ("积分", "text-caption text-center text-medium-emphasis"),
+            ("余额", "text-caption text-center text-medium-emphasis"),
+            ("状态", "text-caption text-center text-medium-emphasis"),
+        ]
+
+        table_content = [{
+            "component": "VTable",
+            "props": {"density": "comfortable"},
+            "content": [
+                {"component": "thead", "content": [
+                    {"component": "tr", "content": [
+                        {"component": "th", "props": {"class": c}, "text": t}
+                        for t, c in header_cells
+                    ]},
+                ]},
+                {"component": "tbody", "content": [
+                    {"component": "tr", "content": [
+                        {"component": "td", "props": {"class": c}, "text": t} for t, c in row
+                    ]} for row in rows
+                ]},
+            ],
+        }] if rows else [
+            {"component": "VAlert",
+             "props": {"type": "info", "variant": "tonal",
+                       "text": "暂无签到记录，点「立即运行一次」或等定时任务执行后生成"}},
+        ]
+
+        page.append({
             "component": "VRow",
             "content": [{
                 "component": "VCol",
                 "props": {"cols": 12},
-                "content": [
-                    {"component": "VAlert",
-                     "props": {"type": "success" if last.get("ok") else "info",
-                               "variant": "tonal", "text": summary}},
-                    {"component": "VTable",
-                     "props": {"density": "compact", "class": "mt-3"},
-                     "content": [
-                         {"component": "thead", "content": [{
-                             "component": "tr",
-                             "content": [
-                                 {"component": "th", "props": {"class": "text-start text-sm"},
-                                  "text": "时间"},
-                                 {"component": "th", "props": {"class": "text-start text-sm"},
-                                  "text": "结果"},
-                                 {"component": "th", "props": {"class": "text-start text-sm"},
-                                  "text": "说明"},
-                             ],
-                         }]},
-                         {"component": "tbody", "content": rows},
-                     ]},
-                ],
+                "content": [{
+                    "component": "VCard",
+                    "props": {"variant": "tonal"},
+                    "content": [
+                        {"component": "VCardTitle", "text": "签到记录（最近 30 条）"},
+                        {"component": "VCardText", "props": {"class": "pa-2"},
+                         "content": table_content},
+                    ],
+                }],
             }],
-        }]
+        })
 
-    @staticmethod
-    def _col(cols: int, component: dict) -> dict:
-        return {"component": "VCol", "props": {"cols": 12, "md": cols},
-                "content": [component]}
+        page.append({
+            "component": "VRow",
+            "content": [{
+                "component": "VCol",
+                "props": {"cols": 12},
+                "content": [{
+                    "component": "VAlert",
+                    "props": {
+                        "type": "info", "variant": "tonal",
+                        "text": "普通签与赌狗签每天二选一：赌狗签按站点档位随机翻倍（暴富 4 倍 10%、小赚 1.5 倍 35%、"
+                                "不亏 1 倍 25%、白签 10%、血亏 -1 倍 20%），加权期望约 0.975 倍且不加经验。"
+                                "想稳定升级就在配置里关掉赌狗签。",
+                    },
+                }],
+            }],
+        })
+
+        return page
+
+    # ------------------------------------------------------------------ 表单
+    def get_form(self) -> Tuple[List[dict], Dict[str, Any]]:
+        from .config_form import build_form
+        return build_form()
 
 
+# ---------------------------------------------------------------------- 工具
 def _bql_endpoint(address: str) -> str:
     """把 Browserless 地址补成 BrowserQL 端点。"""
     base = address.rstrip("/")
@@ -468,6 +698,22 @@ def _split_response(raw: str) -> Tuple[int, Any]:
         return status, json.loads(body)
     except Exception:  # noqa: BLE001
         return status, body[:200]
+
+
+def _to_int(value: Any) -> Optional[int]:
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _fmt(value: Any, suffix: str = "") -> str:
+    num = _to_int(value)
+    if num is not None:
+        return f"{num:,}{suffix}"
+    return "—" if value is None else f"{value}{suffix}"
 
 
 def _already_text(payload: Any, points: Any, level: str) -> str:
