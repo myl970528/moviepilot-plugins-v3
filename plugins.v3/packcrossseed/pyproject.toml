@@ -1,0 +1,6 @@
+[project]
+name = "moviepilot-plugin-packcrossseed"
+dynamic = ["version"]
+description = "拆包辅种：把整包按电影/单集拆开，跨站匹配独立种子并做 piece 级校验，硬链接生成副本后辅种"
+requires-python = ">=3.12"
+dependencies = []
