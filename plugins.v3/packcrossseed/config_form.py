@@ -139,6 +139,13 @@ def build_form(
                                       persistent_hint=True)),
                     ]),
                     row([
+                        col(12, switch("split_only", "只做拆分作种（整包交 iyuu）", "teal",
+                                      hint="开启时只加种源种子集号的真子集（单集 {1} 或两集 {1,2}）；"
+                                           "完整整包（{1,2,3}）一律跳过，交给 iyuu 等通用辅种插件。"
+                                           "关闭则恢复为允许整包辅种",
+                                      persistent_hint=True)),
+                    ]),
+                    row([
                         col(6, textfield("include_keywords", "只处理这些任务（可选）",
                                          placeholder="用逗号分隔，例如 剧名A,剧名B",
                                          hint="按任务名过滤，命中任意一个才拆包；留空=处理全部任务。试点时用它锁定一个包",
@@ -254,6 +261,7 @@ def build_form(
         "min_similarity": 0.25,
         "pieces_to_check": 3,
         "accept_other_release": True,
+        "split_only": True,
         "link_mode": "auto",
         "label": "",
         "auto_start": True,

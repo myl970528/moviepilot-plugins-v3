@@ -30,7 +30,7 @@ import re
 import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
 
 # ---------------------------------------------------------------- 常量
 
@@ -38,6 +38,11 @@ VIDEO_EXT = {
     ".mkv", ".mp4", ".avi", ".ts", ".m2ts", ".mov", ".wmv", ".flv",
     ".rmvb", ".rm", ".m4v", ".mpg", ".mpeg", ".vob", ".webm",
 }
+# 原盘结构与镜像：没有集号语义，站点侧也不存在对应的独立种子。
+# 这类文件拆出来只会拿 00302.m2ts 这样的名字去搜，白烧一次全站搜索。
+SEGMENT_EXT = {".iso", ".bdmv"}
+SEGMENT_PIECE_EXT = {".m2ts", ".mts", ".vob"}
+SEGMENT_DIRS = {"bdmv", "video_ts", "certificate", "bdmv_stream", "stream"}
 # 搜索关键词里要剔除的压制/分辨率噪声词
 NOISE_WORDS = {
     "web", "webdl", "webrip", "dl", "bluray", "bdrip", "brrip", "hdtv",
@@ -69,6 +74,9 @@ class Unit:
     season: int = 0               # 识别到的季（0=电影/未知）
     episode: int = 0              # 识别到的集
     is_episode: bool = False      # 是否剧集单集
+    # 该单元所属「源种子」包含的全部集号。拆包辅种只加种源种子的真子集
+    # （单集 {1} / 两集 {1,2}），完整整包交给 iyuu 之类的通用辅种插件。
+    source_episodes: Set[int] = field(default_factory=set)
     candidates: List["Candidate"] = field(default_factory=list)
 
 
@@ -114,6 +122,21 @@ def normalize(text: str) -> str:
 
 def _is_video(name: str) -> bool:
     return Path(str(name)).suffix.lower() in VIDEO_EXT
+
+
+def _is_segment(name: str) -> bool:
+    """原盘分段/镜像文件（BDMV 的 .m2ts、VIDEO_TS 的 .vob、整盘 .iso）。
+
+    判据分三层：整盘镜像直接排除；落在 BDMV / VIDEO_TS / STREAM 目录里的排除；
+    纯数字命名的 .m2ts（00302.m2ts）也是分段。带集号的 `S01E02.m2ts` 仍按单集处理。
+    """
+    low = str(name).replace("\\", "/").lower()
+    path = Path(low)
+    if path.suffix in SEGMENT_EXT:
+        return True
+    if any(part in SEGMENT_DIRS for part in low.split("/")[:-1]):
+        return True
+    return path.suffix in SEGMENT_PIECE_EXT and path.stem.isdigit()
 
 
 def episode_info(name: str) -> Tuple[int, int, bool]:
@@ -202,6 +225,55 @@ def season_of(title: str) -> int:
     if m:
         return int(m.group(1))
     return 0
+
+
+def episodes_in_title(title: str) -> Set[int]:
+    """从种子标题里提取出现的全部集号（含 E01-E24 这类区间展开）。
+
+    用于「拆分作种」模式下提前识别整包候选、避免白下载种子。
+    区间展开设有上限，防止 E01-E999 这类误写撑爆内存。
+    """
+    s = str(title or "")
+    out: Set[int] = set()
+    # 区间：E01-E24 / E01~E24 / S01E01-E24 / 01-24集
+    for m in re.finditer(r"[Ee](\d{1,4})\s*[-~–至到]\s*[Ee]?(\d{1,4})", s):
+        a, b = int(m.group(1)), int(m.group(2))
+        if 0 < a <= b and b - a <= 200:
+            out.update(range(a, b + 1))
+    for m in re.finditer(r"第\s*(\d{1,4})\s*集\s*[-~–至到]\s*第?\s*(\d{1,4})", s):
+        a, b = int(m.group(1)), int(m.group(2))
+        if 0 < a <= b and b - a <= 200:
+            out.update(range(a, b + 1))
+    # 单集标记：SxxEyy / Exy / 第N集
+    for m in re.finditer(r"[Ss]\d{1,2}[Ee](\d{1,4})", s):
+        out.add(int(m.group(1)))
+    for m in re.finditer(r"(?<![\dEe])(?<!\d)[Ee](\d{1,4})(?!\d)", s):
+        out.add(int(m.group(1)))
+    for m in re.finditer(r"第\s*(\d{1,4})\s*集", s):
+        out.add(int(m.group(1)))
+    return out
+
+
+_FULL_PACK_WORDS = ("complete", "season", "全集", "全季", "全集合集", "全24集", "全集全季")
+
+
+def is_full_pack_title(title: str, source_episode_count: int) -> bool:
+    """标题是否明显是「整包」（拆分模式下要剔除、交由 iyuu 辅种）。
+
+    判据任一命中即为整包：
+      - 标题含 Complete / Season / 全集 等整包词；
+      - 有季号但完全没有集号（形如 S01，通常是整季）；
+      - 标题里出现的集号数量 >= 源种子集数（覆盖了源的全部或更多集）。
+    """
+    low = str(title or "").lower()
+    if any(w in low for w in _FULL_PACK_WORDS):
+        return True
+    eps = episodes_in_title(title)
+    if season_of(title) and not eps:
+        return True
+    if source_episode_count > 0 and len(eps) >= source_episode_count:
+        return True
+    return False
 
 
 def infohash_of(blob: bytes) -> str:
@@ -329,10 +401,24 @@ def discover_units(
         if not meta or not meta["files"]:
             continue
 
+        # 汇总这个源种子的全部集号：拆分作种只加种它的真子集，
+        # 完整整包（== 源）交给 iyuu 等通用辅种插件处理。
+        source_eps: Set[int] = set()
+        for f in meta["files"]:
+            rel_all = os.path.join(*f["path"]) if f["path"] else meta["name"]
+            if not _is_video(rel_all) or _is_segment(rel_all):
+                continue
+            _s, _e, _is_ep = episode_info(rel_all)
+            if _is_ep and _e:
+                # 用 episodes_in_title 展开区间命名（S01E01-E02 -> {1,2}），
+                # 只取 episode_info 的第一个集会漏集、导致真子集判定误杀。
+                expanded = episodes_in_title(os.path.basename(rel_all))
+                source_eps.update(expanded or {_e})
+
         current: List[Unit] = []
         for f in meta["files"]:
             rel = os.path.join(*f["path"]) if f["path"] else meta["name"]
-            if not _is_video(rel):
+            if not _is_video(rel) or _is_segment(rel):
                 continue
             size = int(f["length"])
             if size < min_size:
@@ -363,6 +449,7 @@ def discover_units(
                 season=season,
                 episode=episode,
                 is_episode=is_ep,
+                source_episodes=set(source_eps),
             ))
             if 0 < max_per_task <= len(current):
                 break
@@ -388,6 +475,7 @@ def screen_candidates(
     size_tolerance: float,
     min_similarity: float,
     max_candidates: int,
+    split_only: bool = False,
 ) -> List[Candidate]:
     """对站内搜索原始结果做集号 + 体积 + 名称粗筛。
 
@@ -403,6 +491,11 @@ def screen_candidates(
     """
     out: List[Candidate] = []
     want_season, want_episode = unit.season, unit.episode
+    src_eps: Set[int] = set(unit.source_episodes)
+    # 拆分作种：源不是多集整包（电影/单集）就没有「更小的块」可加，
+    # 完整资源交给 iyuu 等通用辅种插件，这里直接不产生候选。
+    if split_only and len(src_eps) < 2:
+        return []
     for item in raw:
         enclosure = str(item.get("enclosure") or "")
         if not enclosure:
@@ -410,6 +503,11 @@ def screen_candidates(
         title = str(item.get("title") or "")
         size = int(item.get("size") or 0)
         if size <= 0:
+            continue
+
+        # 拆分作种：标题级先剔除整包（Complete/S01 无集号/集号覆盖源全集），
+        # 既符合「只加真子集」的语义，也省下整包种子的下载请求（馒头配额有限）。
+        if split_only and is_full_pack_title(title, len(src_eps)):
             continue
 
         c_season, c_episode, c_is_episode = episode_info(title)
@@ -626,6 +724,29 @@ def verify_local_file_in_torrent(
     return matched, checked, "OK"
 
 
+def episodes_of_meta(meta: Dict[str, Any]) -> Set[int]:
+    """从种子真实文件列表提取集号集合（比标题解析精确）。"""
+    out: Set[int] = set()
+    for f in meta.get("files") or []:
+        rel = os.path.join(*f["path"]) if f.get("path") else str(meta.get("name") or "")
+        if not _is_video(rel) or _is_segment(rel):
+            continue
+        _s, _e, _is_ep = episode_info(rel)
+        if _is_ep and _e:
+            expanded = episodes_in_title(os.path.basename(rel))
+            out.update(expanded or {_e})
+    return out
+
+
+def proper_subset(candidate: Set[int], source: Set[int]) -> bool:
+    """candidate 是否为 source 的非空真子集（拆分作种的判定核心）。
+
+    单集 {1} ⊂ {1,2,3}、两集 {1,2} ⊂ {1,2,3} 成立；
+    整包 {1,2,3}（相等）、超集、含源外集号、空集都不成立。
+    """
+    return bool(candidate) and candidate < source
+
+
 def size_of_meta(meta: Dict[str, Any]) -> int:
     return int(meta.get("total") or 0)
 
@@ -654,6 +775,7 @@ def materialize(
     target_source: str = "",
     season: int = 0,
     episode: int = 0,
+    episode_resolver: Optional[Callable[[str, int, int], str]] = None,
 ) -> Tuple[List[Operation], List[str]]:
     """按候选种子文件布局，在 dst_base 下生成独立副本。
 
@@ -663,6 +785,10 @@ def materialize(
     target_source 是本地这一集的真实文件：候选种子里的文件名可能与本地不同
     （不同站点重命名、重打包），但它与本地文件字节相同，所以按候选种子要求的
     相对路径落盘、内容直接硬链接本地文件，TR 才能按种子布局校验并做种。
+
+    episode_resolver 用于多集候选（如 {1,2}）：候选种子含多个集，除当前单元这一集
+    外，其余集需要按 (季,集)+体积在源目录找本地文件。签名 (rel, length, ...) 由
+    调用方注入；这里按 (rel, episode, length) 调用，返回本地绝对路径或空串。
 
     返回 (写操作列表, 缺失文件列表)。缺失列表非空说明本地凑不齐这个种子，
     加进去 TR 会一直校验失败或去补下载，调用方应放弃加种。
@@ -703,6 +829,14 @@ def materialize(
                 alt = os.path.join(src_base, os.path.basename(rel))
                 if os.path.exists(alt):
                     src = alt
+        # 多集候选兜底：相对路径和文件名都没命中时，按候选文件的集号+体积
+        # 在源目录找本地对应集（跨发布组文件名不同也能命中）。
+        if (not src or not os.path.exists(src)) and episode_resolver:
+            _es, _ee, _eep = episode_info(os.path.basename(rel))
+            if _eep and _ee:
+                resolved = episode_resolver(rel, _ee, int(f["length"]))
+                if resolved and os.path.exists(resolved):
+                    src = resolved
         if not src or not os.path.exists(src):
             log(f"物化跳过（源文件不存在）: {rel}")
             missing.append(rel)

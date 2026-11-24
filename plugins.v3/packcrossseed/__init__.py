@@ -31,9 +31,14 @@ from .engine import (
     Candidate,
     Operation,
     Unit,
+    _is_video,
     discover_units,
+    episode_info,
+    episodes_of_meta,
+    is_full_pack_title,
     materialize,
     parse_torrent,
+    proper_subset,
     screen_candidates,
     verify_local_file_in_torrent,
 )
@@ -50,7 +55,7 @@ class PackCrossSeed(_PluginBase):
     plugin_name = "拆包辅种"
     plugin_desc = "整包按电影/单集拆分，跨站匹配独立种子并做 piece 校验，硬链接生成副本后辅种。原包不动。"
     plugin_icon = "package.png"
-    plugin_version = "1.0.7"
+    plugin_version = "1.2.0"
     plugin_author = "sdcsmyl"
     author_url = ""
     plugin_config_prefix = "packcrossseed_"
@@ -77,6 +82,9 @@ class PackCrossSeed(_PluginBase):
     _min_similarity: float = 0.25
     _pieces_to_check: int = 3
     _accept_other_release: bool = True
+    # 只做拆分作种：候选必须是源种子集号的真子集（单集/两集组合），
+    # 完整整包交给 iyuu 等通用辅种插件。默认开启。
+    _split_only: bool = True
     _link_mode: str = "auto"
     _label: str = ""
     _auto_start: bool = True
@@ -87,6 +95,10 @@ class PackCrossSeed(_PluginBase):
     _debug: bool = False
 
     _running: bool = False
+    # 单轮运行内的搜索缓存：同一关键词只打一次站点（每轮开始清空）
+    _search_cache: Dict[str, List[dict]] = {}
+    _ep_index: Dict[str, Dict[Any, List[Tuple[str, int]]]] = {}
+    _all_instances: List[Any] = []
     _stop_flag: bool = False
     _lock = threading.Lock()
     _progress: Dict[str, Any] = {}
@@ -113,6 +125,7 @@ class PackCrossSeed(_PluginBase):
             self._min_similarity = float(config.get("min_similarity") or 0.25)
             self._pieces_to_check = self.__as_int(config.get("pieces_to_check"), 3)
             self._accept_other_release = bool(config.get("accept_other_release", True))
+            self._split_only = bool(config.get("split_only", True))
             self._link_mode = str(config.get("link_mode") or "auto").strip()
             self._label = str(config.get("label") or "").strip()
             self._auto_start = bool(config.get("auto_start", True))
@@ -185,6 +198,7 @@ class PackCrossSeed(_PluginBase):
             "min_similarity": self._min_similarity,
             "pieces_to_check": self._pieces_to_check,
             "accept_other_release": self._accept_other_release,
+            "split_only": self._split_only,
             "link_mode": self._link_mode,
             "label": self._label,
             "auto_start": self._auto_start,
@@ -198,7 +212,7 @@ class PackCrossSeed(_PluginBase):
     def __downloader_choices(self) -> List[dict]:
         """运行时从 MP 拉取下载器列表（只回名字，不含地址/账号）。"""
         try:
-            services = DownloaderHelper().get_services(type_filter="transmission") or {}
+            services = DownloaderHelper().get_services() or {}
             return [{"title": name, "value": name} for name in services]
         except Exception as err:  # noqa: BLE001
             logger.warning(f"拆包辅种：拉取下载器列表失败 {err}")
@@ -252,7 +266,7 @@ class PackCrossSeed(_PluginBase):
             ("mdi-package-variant", "发现单元", int(result.get("units") or 0), "primary",
              f"来源任务 {result.get('tasks') or 0} 个"),
             ("mdi-magnify", "校验通过", int(result.get("verified") or 0), "info",
-             f"候选 {result.get('candidates') or 0} 个"),
+             f"已有 {int(result.get('dup') or 0)} · 候选 {result.get('candidates') or 0} 个"),
             ("mdi-file-link", "已物化副本", int(result.get("materialized") or 0), "success",
              "硬链优先，源文件只读"),
             ("mdi-upload-network", "已加种", int(result.get("seeded") or 0), "warning",
@@ -454,10 +468,20 @@ class PackCrossSeed(_PluginBase):
                 return
             self._running = True
             self._stop_flag = False
+            self._search_cache = {}
+            self._ep_index = {}
+            self._all_instances = []
+            try:
+                for _info in (DownloaderHelper().get_services() or {}).values():
+                    _inst = getattr(_info, "instance", None)
+                    if _inst and not getattr(_inst, "is_inactive", lambda: False)():
+                        self._all_instances.append(_inst)
+            except Exception:  # noqa: BLE001
+                pass
         started = time.time()
         stats: Dict[str, Any] = {
             "units": 0, "tasks": 0, "candidates": 0, "verified": 0,
-            "materialized": 0, "seeded": 0, "failed": 0,
+            "materialized": 0, "seeded": 0, "failed": 0, "dup": 0,
             "mode": "试跑" if self._dry_run else "执行",
             "message": "",
         }
@@ -495,6 +519,7 @@ class PackCrossSeed(_PluginBase):
                         size_tolerance=self._size_tolerance / 100.0,
                         min_similarity=self._min_similarity,
                         max_candidates=self._max_candidates,
+                        split_only=self._split_only,
                     )
                     stats["candidates"] += len(cands)
                     if self._debug:
@@ -521,16 +546,25 @@ class PackCrossSeed(_PluginBase):
                         continue
                     stats["verified"] += 1
 
-                    if self._dry_run:
-                        unit.candidates = [best]
-                        continue
-
-                    # --- 4. 物化
+                    # 判重必须早于物化：op-TR 同时是源和目标，源任务自身的
+                    # infohash 天然会命中这里。若先物化再判重，会白建一整套
+                    # 硬链接、白读几十 GB 算 piece，最后才说「已有该种子」，
+                    # 留下没人做种的孤儿副本。
                     seed_blob = best.torrent_blob
                     meta = parse_torrent(seed_blob)
                     if not meta:
                         stats["failed"] += 1
                         continue
+                    if self.__is_duplicate(target, meta):
+                        stats["dup"] += 1
+                        self._log(f"  目标下载器已有该种子，跳过: {unit.name[:40]}")
+                        continue
+
+                    if self._dry_run:
+                        unit.candidates = [best]
+                        continue
+
+                    # --- 4. 物化
                     ops, missing = materialize(
                         meta,
                         src_base=os.path.dirname(unit.source_path),
@@ -540,6 +574,9 @@ class PackCrossSeed(_PluginBase):
                         target_source=unit.source_path,
                         season=unit.season,
                         episode=unit.episode,
+                        episode_resolver=self.__make_episode_resolver(
+                            os.path.dirname(unit.source_path)
+                        ),
                     )
                     if missing:
                         self._log(
@@ -589,14 +626,15 @@ class PackCrossSeed(_PluginBase):
                 self.post_message(
                     title="拆包辅种 · 运行完成",
                     text=(f"单元 {stats['units']} · 校验通过 {stats['verified']} · "
-                          f"物化 {stats['materialized']} · 加种 {stats['seeded']} · "
-                          f"耗时 {stats['elapsed']}s" + (f"\n{stats['message']}" if stats["message"] else "")),
+                          f"已有 {stats['dup']} · 物化 {stats['materialized']} · "
+                          f"加种 {stats['seeded']} · 耗时 {stats['elapsed']}s"
+                          + (f"\n{stats['message']}" if stats["message"] else "")),
                 )
 
     # ================================================================ 内部方法
     def __collect_tasks(self) -> List[dict]:
         """从已配置下载器收集已完成任务的种子路径与保存目录。"""
-        services = DownloaderHelper().get_services(type_filter="transmission") or {}
+        services = DownloaderHelper().get_services() or {}
         wants = {x.lower() for x in self._source_downloaders}
         tasks: List[dict] = []
         for name, info in services.items():
@@ -608,13 +646,13 @@ class PackCrossSeed(_PluginBase):
                 continue
             for t in self.__load_torrents(instance, str(name)):
                 try:
-                    pct = float(self.__attr(t, "percent_done", "percentDone", default=0))
+                    pct = float(self.__attr(t, "percent_done", "percentDone", "progress", default=0))
                 except (TypeError, ValueError):
                     continue
                 if self._only_finished and pct < 0.999:
                     continue
-                save_path = str(self.__attr(t, "download_dir", "downloadDir", default="") or "")
-                hash_str = str(self.__attr(t, "hash_string", "hashString", default="") or "").lower()
+                save_path = str(self.__attr(t, "download_dir", "downloadDir", "save_path", default="") or "")
+                hash_str = str(self.__attr(t, "hash_string", "hashString", "hash", default="") or "").lower()
                 torrent_path = self.__find_torrent_file(hash_str)
                 if not torrent_path or not save_path:
                     continue
@@ -735,12 +773,23 @@ class PackCrossSeed(_PluginBase):
                 except (TypeError, ValueError):
                     continue
             sites = picked or None
+        # 同一关键词在一轮里会重复出现：同一个包挂了多个任务副本时，
+        # 每集的关键词完全一样，搜一次 398 条、过滤一遍，重复做纯属浪费。
+        cache_key = (unit.search_keyword or "").strip().lower()
+        if cache_key and cache_key in self._search_cache:
+            return self._search_cache[cache_key]
         try:
+            # rule_groups 显式传空列表：MP 只在它为 None 时才套用系统配置的
+            # SearchFilterRuleGroups（本站当前是「免费优先-画质通用」），传 [] 会
+            # 在 filter 里走 `if not rule_groups: return torrents` 直接放行。
+            # 拆包辅种只关心文件内容是否一致，不需要画质/免费倾向，
+            # 套默认规则会把本可对上的单集种直接过滤掉，表现为「搜索有结果、候选 0」。
             results = SearchChain().search_by_title(
                 title=unit.search_keyword,
                 page=0,
                 sites=sites,
                 cache_local=False,
+                rule_groups=[],
             ) or []
         except Exception as err:  # noqa: BLE001
             self._log(f"搜索失败 {unit.search_keyword[:30]}: {str(err)[:80]}")
@@ -771,6 +820,8 @@ class PackCrossSeed(_PluginBase):
                 "ua": str(gv("site_ua", default="") or ""),
                 "referer": str(gv("page_url", default="") or ""),
             })
+        if cache_key:
+            self._search_cache[cache_key] = out
         return out
 
     def __verify_candidate(self, unit: Unit, cand: Candidate) -> Tuple[bool, str]:
@@ -785,6 +836,20 @@ class PackCrossSeed(_PluginBase):
             return False, cand.verify_reason
         cand.torrent_blob = blob
         cand.infohash = meta.get("infohash") or ""
+        # 拆分作种：候选种子的真实文件集号必须是源种子集号的「非空真子集」。
+        # 这是比标题更精确的判定——标题可能不写全集号，但种子文件列表骗不了人。
+        # 完整整包（== 源）交给 iyuu，单集 {1} 和两集 {1,2} 才放行。
+        if self._split_only:
+            src_eps = set(unit.source_episodes)
+            cand_eps = episodes_of_meta(meta)
+            if len(src_eps) < 2:
+                cand.verify_reason = "源不是多集整包，完整资源交 iyuu，跳过"
+                return False, cand.verify_reason
+            if not proper_subset(cand_eps, src_eps):
+                cand.verify_reason = (
+                    f"候选集号 {sorted(cand_eps)} 非源 {sorted(src_eps)} 的真子集（整包/超集），跳过"
+                )
+                return False, cand.verify_reason
         # 整包/合集候选：本地缺文件就没必要再做 piece 校验和物化。
         # 否则每集都要下种子、逐条比对、最后才发现缺 43 集，白烧 IO 和日志。
         base = os.path.dirname(unit.source_path)
@@ -795,6 +860,12 @@ class PackCrossSeed(_PluginBase):
                 rel = os.path.join(*f["path"]) if f["path"] else ""
                 paths = [os.path.join(base, rel), os.path.join(base, os.path.basename(rel))]
                 if any(p and os.path.exists(p) for p in paths):
+                    have += 1
+                    continue
+                # 跨站辅种时两边是不同发布组，文件名必然不同，只按名字精确匹配
+                # 会把整包全部判成「本地没有」。这里退一步按季集号 + 体积在本地
+                # 目录里找同一集，体积差得远的仍视为不同版本、不算命中。
+                if self.__match_local_episode(base, f):
                     have += 1
             if have < need:
                 cand.verify_reason = (
@@ -872,10 +943,18 @@ class PackCrossSeed(_PluginBase):
         body = getattr(res, "content", b"") or b""
         if code == 200 and body[:1] == b"d" and b"announce" in body[:4000]:
             return bytes(body)
-        # 有些站点先回一段 JSON / 页面，里面才是临时下载地址
-        text = body.decode("utf-8", "ignore") if body else ""
+        # 有些站点先回一段 JSON / 页面，里面才是临时下载地址。
+        # 关键：站点把链接写成 JSON 转义形式 https:\/\/...，不先还原，
+        # 下面的 https?:// 正则一条都匹配不到，会误判成「没给链接」。
+        text = (body.decode("utf-8", "ignore") if body else "").replace("\\/", "/")
         link = re.search(r"https?://[^\s\"'<>]+\.torrent[^\s\"'<>]*", text) \
             or re.search(r"https?://[^\s\"'<>]{20,}", text)
+        if code == 200 and not link:
+            # data 里也可能是站内相对路径（/api/torrent/xxx），拼上站点域名再试
+            rel = re.search(r"\"(?:data|url|link)\"\s*:\s*\"(/[^\"]{4,})\"", text)
+            base = re.match(r"https?://[^/]+", url)
+            if rel and base:
+                link = re.match(r"(.*)", base.group(0) + rel.group(1))
         if code == 200 and link:
             real = link.group(0).replace("\\/", "/")
             try:
@@ -883,10 +962,16 @@ class PackCrossSeed(_PluginBase):
                     ua=cand.ua or None, cookies=cand.cookie or None, timeout=30
                 ).get_res(real, allow_redirects=True)
                 body2 = getattr(res2, "content", b"") or b"" if res2 else b""
-                if int(getattr(res2, "status_code", 0) or 0) == 200 and body2[:1] == b"d":
+                code2 = int(getattr(res2, "status_code", 0) or 0)
+                if code2 == 200 and body2[:1] == b"d":
                     return bytes(body2)
-            except Exception:  # noqa: BLE001
-                pass
+                # 二跳也失败时说清楚是哪一步断的，别让上层只看到「解析失败」
+                self._log(
+                    f"换票二跳未拿到种子 {cand.site}: HTTP {code2} 长度 {len(body2)}"
+                    f"{self.__explain_body(body2)}"
+                )
+            except Exception as err:  # noqa: BLE001
+                self._log(f"换票二跳异常 {cand.site}: {str(err)[:70]}")
         # 失败原因只打状态码、长度与站点自述的原因，避免把票据、令牌带进日志
         detail = self.__explain_body(body)
         self._log(f"换票未拿到种子 {cand.site}: HTTP {code} 长度 {len(body)}{detail}")
@@ -1023,7 +1108,7 @@ class PackCrossSeed(_PluginBase):
         return bytes(res.content)
 
     def __pick_target_downloader(self) -> Any:
-        services = DownloaderHelper().get_services(type_filter="transmission") or {}
+        services = DownloaderHelper().get_services() or {}
         want = self._target_downloader.strip().lower()
         for name, info in services.items():
             if want and str(name).lower() != want:
@@ -1033,11 +1118,115 @@ class PackCrossSeed(_PluginBase):
                 return info
         return None
 
+    def __make_episode_resolver(self, base: str):
+        """生成物化用的本地集定位器：按 (季,集)+体积容差在源目录找文件。
+
+        供 materialize() 处理多集候选（如 {1,2}）：除当前单元这一集外，
+        候选种子里的其它集也要在源目录找到本地对应文件才能正确硬链接。
+        忽略传入的 rel 文件名（跨发布组必不同），只认解析出的集号 + 体积。
+        """
+        index = self.__local_episode_index(base)
+
+        def resolve(_rel: str, episode: int, length: int) -> str:
+            # rel 里带季号时用它，避免跨季集号撞车；解析不到则用 0（匹配任意季）
+            rel_season, _rel_ep, _is_ep = episode_info(os.path.basename(_rel))
+            candidates: List[Tuple[str, int]] = []
+            for (season, ep), items in index.items():
+                if ep != episode:
+                    continue
+                if rel_season and season and season != rel_season:
+                    continue
+                candidates.extend(items)
+            if not candidates:
+                return ""
+            want = int(length or 0)
+            if want:
+                for path, size in candidates:
+                    if abs(size - want) <= max(int(want * 0.15), 64 * 1024 * 1024):
+                        return path
+            return candidates[0][0]
+
+        return resolve
+
+    def __match_local_episode(self, base: str, item: dict) -> bool:
+        """按季集号 + 体积在本地目录里找种子内同一集的文件。
+
+        跨站辅种时两边常出自不同发布组（`[生逢其时].In.My.Prime...` 对
+        `In My Prime S01E12-E13...`），文件名对不上，只按名字精确匹配会把
+        整包全判成「本地没有」。体积用来排除「同一集但不同版本」，差太远不算命中。
+        """
+        rel = os.path.join(*item["path"]) if item.get("path") else ""
+        season, episode, is_episode = episode_info(os.path.basename(rel))
+        if not is_episode or not episode:
+            return False
+        index = self.__local_episode_index(base)
+        want = int(item.get("length") or 0)
+        for _path, size in index.get((season, episode), []):
+            if not want:
+                return True
+            if abs(size - want) <= max(int(want * 0.15), 64 * 1024 * 1024):
+                return True
+        return False
+
+    def __local_episode_index(self, base: str) -> Dict[Any, List[Tuple[str, int]]]:
+        """把本地目录里的视频文件按 (季, 集) 建索引，按目录缓存。"""
+        cached = self._ep_index.get(base)
+        if cached is not None:
+            return cached
+        index: Dict[Any, List[Tuple[str, int]]] = {}
+        try:
+            for name in os.listdir(base):
+                path = os.path.join(base, name)
+                try:
+                    if not os.path.isfile(path) or not _is_video(name):
+                        continue
+                    size = os.path.getsize(path)
+                except OSError:
+                    continue
+                season, episode, is_episode = episode_info(name)
+                if not is_episode or not episode:
+                    continue
+                index.setdefault((season, episode), []).append((path, size))
+        except OSError:
+            pass
+        self._ep_index[base] = index
+        return index
+
+    def __is_duplicate(self, target: Any, meta: dict) -> bool:
+        """任一已配置下载器里是否已有这个种子。
+
+        必须在物化之前问。除了源任务自身（op-TR 同时是源和目标），多台
+        下载器通过 NFS 指向同一物理目录时，同一 hash 在两台里各加一遍会
+        触发 "You cannot seed the same torrent in the same location" 错误。
+        """
+        hash_str = str((meta or {}).get("infohash") or "").lower()
+        if not hash_str:
+            return False
+        instances = list(self._all_instances or [])
+        if target:
+            inst = getattr(target, "instance", None)
+            if inst is not None and inst not in instances:
+                instances.append(inst)
+        for instance in instances:
+            try:
+                existing = instance.get_torrents(ids=[hash_str])
+                items = existing[0] if isinstance(existing, tuple) else existing
+                if items:
+                    return True
+            except Exception:  # noqa: BLE001
+                continue
+        return False
+
     def __add_torrent(self, target, blob: bytes, meta: dict, ops: List[Operation]) -> bool:
-        """把种子加到目标下载器，download_dir 指向副本根目录的父级。"""
+        """把种子加到目标下载器，download_dir 指向副本根目录的父级。
+
+        标签参数各家不同：Transmission 认 labels（列表），qBittorrent 认 tag
+        （字符串）。按 ServiceInfo 的 type 分派，别把 TR 的参数名硬塞给 qB。
+        """
         instance = getattr(target, "instance", None)
         if not instance:
             return False
+        kind = str(getattr(target, "type", "") or "").lower()
         # 按 infohash 判重，避免同一资源被重复添加
         hash_str = str(meta.get("infohash") or "").lower()
         if hash_str:
@@ -1049,16 +1238,20 @@ class PackCrossSeed(_PluginBase):
                     return False
             except Exception as err:  # noqa: BLE001
                 logger.warning(f"拆包辅种：判重查询失败 {err}")
-        # 副本根目录 = output_dir/<种子名>；TR 的种子内容从 output_dir 开始按种子内路径落盘
+        # 副本根目录 = output_dir/<种子名>；种子内容从 output_dir 开始按种子内路径落盘
         download_dir = self._output_dir
-        labels = [self._label] if self._label else None
+        kwargs: Dict[str, Any] = {
+            "content": blob,
+            "is_paused": not self._auto_start,
+            "download_dir": download_dir,
+        }
+        if self._label:
+            if kind.startswith("qb"):
+                kwargs["tag"] = self._label
+            else:
+                kwargs["labels"] = [self._label]
         try:
-            instance.add_torrent(
-                content=blob,
-                is_paused=not self._auto_start,
-                download_dir=download_dir,
-                labels=labels,
-            )
+            instance.add_torrent(**kwargs)
             ops.append(Operation("add_torrent", download_dir, meta.get("name", ""), "在下载器里删除对应任务"))
             self._log(f"已加种: {meta.get('name','')[:50]}")
             return True
@@ -1120,6 +1313,7 @@ class PackCrossSeed(_PluginBase):
             "season": u.season,
             "episode": u.episode,
             "source_task": u.source_task,
+            "source_episodes": sorted(u.source_episodes),
             "candidates": len(u.candidates),
             "keyword": u.search_keyword,
         }
