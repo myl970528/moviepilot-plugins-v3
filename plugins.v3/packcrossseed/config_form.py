@@ -201,7 +201,7 @@ def build_form(
                                       persistent_hint=True)),
                         col(6, textfield("label", "加种标签",
                                          placeholder="自行填写，例如 拆包辅种",
-                                         hint="新任务打上的标签，方便和原包区分",
+                                         hint="新任务打上的标签，方便和原包区分；另会自动加上候选来源站点名作为第二个标签",
                                          persistent_hint=True, clearable=True)),
                     ]),
                     row([

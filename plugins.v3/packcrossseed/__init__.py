@@ -55,7 +55,7 @@ class PackCrossSeed(_PluginBase):
     plugin_name = "拆包辅种"
     plugin_desc = "整包按电影/单集拆分，跨站匹配独立种子并做 piece 校验，硬链接生成副本后辅种。原包不动。"
     plugin_icon = "package.png"
-    plugin_version = "1.2.0"
+    plugin_version = "1.2.1"
     plugin_author = "sdcsmyl"
     author_url = ""
     plugin_config_prefix = "packcrossseed_"
@@ -591,8 +591,8 @@ class PackCrossSeed(_PluginBase):
                     stats["materialized"] += sum(
                         1 for o in ops if o.action in ("hardlink", "symlink", "copy")
                     )
-                    # --- 5. 加种
-                    if self.__add_torrent(target, seed_blob, meta, ops):
+                    # --- 5. 加种（带上候选来源站点名，作为第二个标签）
+                    if self.__add_torrent(target, seed_blob, meta, ops, site=best.site):
                         stats["seeded"] += 1
                 except Exception as err:  # noqa: BLE001
                     stats["failed"] += 1
@@ -1217,11 +1217,15 @@ class PackCrossSeed(_PluginBase):
                 continue
         return False
 
-    def __add_torrent(self, target, blob: bytes, meta: dict, ops: List[Operation]) -> bool:
+    def __add_torrent(self, target, blob: bytes, meta: dict, ops: List[Operation],
+                      site: str = "") -> bool:
         """把种子加到目标下载器，download_dir 指向副本根目录的父级。
 
         标签参数各家不同：Transmission 认 labels（列表），qBittorrent 认 tag
         （字符串）。按 ServiceInfo 的 type 分派，别把 TR 的参数名硬塞给 qB。
+
+        打了两类标签：配置的通用标签（如「拆包辅种」）+ 候选来源站点名，
+        方便在下载器里按站点筛选、与原始整包任务区分。
         """
         instance = getattr(target, "instance", None)
         if not instance:
@@ -1245,11 +1249,17 @@ class PackCrossSeed(_PluginBase):
             "is_paused": not self._auto_start,
             "download_dir": download_dir,
         }
-        if self._label:
+        # 标签 = 配置的通用标签 + 候选来源站点名（去空、去重、保序）
+        labels: List[str] = []
+        for value in (self._label, str(site or "").strip()):
+            if value and value not in labels:
+                labels.append(value)
+        if labels:
             if kind.startswith("qb"):
-                kwargs["tag"] = self._label
+                # qB 的 tag 是逗号分隔的单个字符串
+                kwargs["tag"] = ",".join(labels)
             else:
-                kwargs["labels"] = [self._label]
+                kwargs["labels"] = labels
         try:
             instance.add_torrent(**kwargs)
             ops.append(Operation("add_torrent", download_dir, meta.get("name", ""), "在下载器里删除对应任务"))
