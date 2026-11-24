@@ -212,6 +212,14 @@ def build_form(
                                       hint="每轮跑完推送发现 / 校验 / 加种统计",
                                       persistent_hint=True)),
                     ]),
+                    row([
+                        col(6, switch("verify_after_add", "加种后复核任务状态", "teal",
+                                      hint="开启后校验新任务真实 hash 并触发 recheck，防止加种接口返回旧任务导致误报；已存在且被暂停的完整任务会自动恢复做种",
+                                      persistent_hint=True)),
+                        col(6, switch("check_site_flow", "下载前检查站点流控", "orange",
+                                      hint="开启后下载种子前查询站点流控状态，命中则跳过该候选，避免频繁访问触发站点限制",
+                                      persistent_hint=True)),
+                    ]),
                 ]),
 
                 # ── 定时与调试 ──
@@ -265,6 +273,8 @@ def build_form(
         "link_mode": "auto",
         "label": "",
         "auto_start": True,
+        "verify_after_add": True,
+        "check_site_flow": True,
         "notify": True,
         "cron": "",
         "auto_mode": False,

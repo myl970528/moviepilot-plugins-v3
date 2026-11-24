@@ -55,7 +55,7 @@ class PackCrossSeed(_PluginBase):
     plugin_name = "拆包辅种"
     plugin_desc = "整包按电影/单集拆分，跨站匹配独立种子并做 piece 校验，硬链接生成副本后辅种。原包不动。"
     plugin_icon = "package.png"
-    plugin_version = "1.2.1"
+    plugin_version = "1.2.2"
     plugin_author = "sdcsmyl"
     author_url = ""
     plugin_config_prefix = "packcrossseed_"
@@ -88,6 +88,10 @@ class PackCrossSeed(_PluginBase):
     _link_mode: str = "auto"
     _label: str = ""
     _auto_start: bool = True
+    # 加种可靠性：加种后校验任务真实状态、失败时重试、跟踪 recheck（借鉴 IYUU/青蛙/猪猪）
+    _verify_after_add: bool = True
+    # 下载种子前检查站点流控，命中则跳过该候选（借鉴 IYUU 的 sites_helper.check）
+    _check_site_flow: bool = True
     _notify: bool = True
     _cron: str = ""
     _auto_mode: bool = False
@@ -129,6 +133,8 @@ class PackCrossSeed(_PluginBase):
             self._link_mode = str(config.get("link_mode") or "auto").strip()
             self._label = str(config.get("label") or "").strip()
             self._auto_start = bool(config.get("auto_start", True))
+            self._verify_after_add = bool(config.get("verify_after_add", True))
+            self._check_site_flow = bool(config.get("check_site_flow", True))
             self._notify = bool(config.get("notify", True))
             self._cron = str(config.get("cron") or "").strip()
             self._auto_mode = bool(config.get("auto_mode"))
@@ -202,6 +208,8 @@ class PackCrossSeed(_PluginBase):
             "link_mode": self._link_mode,
             "label": self._label,
             "auto_start": self._auto_start,
+            "verify_after_add": self._verify_after_add,
+            "check_site_flow": self._check_site_flow,
             "notify": self._notify,
             "cron": self._cron,
             "auto_mode": self._auto_mode,
@@ -963,7 +971,7 @@ class PackCrossSeed(_PluginBase):
                 ).get_res(real, allow_redirects=True)
                 body2 = getattr(res2, "content", b"") or b"" if res2 else b""
                 code2 = int(getattr(res2, "status_code", 0) or 0)
-                if code2 == 200 and body2[:1] == b"d":
+                if code2 == 200 and not self.__is_error_page(body2):
                     return bytes(body2)
                 # 二跳也失败时说清楚是哪一步断的，别让上层只看到「解析失败」
                 self._log(
@@ -1048,11 +1056,45 @@ class PackCrossSeed(_PluginBase):
             return " 返回的是网页"
         return ""
 
+    # 站点下载失败时常见的错误页字节串：命中即视为没拿到种子，别喂给解析器
+    # （借鉴青蛙辅种助手对「你没有该权限」的识别，此处补充常见几种）。
+    _DL_ERROR_MARKERS = (
+        "你没有该权限".encode("utf-8"),
+        "无权限下载".encode("utf-8"),
+        "请登录".encode("utf-8"),
+        "种子不存在".encode("utf-8"),
+        "triggered the rate limit".encode("utf-8"),
+    )
+
+    @classmethod
+    def __is_error_page(cls, body: bytes) -> bool:
+        """200 但内容是错误页/无权限提示时，识别出来当作下载失败。"""
+        if not body:
+            return True
+        # 真种子必是 bencode 字典（以 d 开头）
+        if body[:1] == b"d":
+            return False
+        head = body[:4096]
+        return any(marker in head for marker in cls._DL_ERROR_MARKERS)
+
     def __download_torrent(self, cand: Candidate) -> bytes:
         """下载候选种子文件。站点凭据只在内存中传递，不落盘、不进日志。
 
-        顺序：站点换票配方 → MP 自带下载服务 → 直连。
+        顺序：站点流控检查 → 站点换票配方 → MP 自带下载服务 → 直连。
         """
+        # 站点流控检查（借鉴 IYUU）：命中流控的站点跳过该候选，避免频繁访问
+        # 触发封禁。check() 返回 (是否命中, 原因)，取不到站点时放行、不误伤。
+        if self._check_site_flow and cand.page_url:
+            try:
+                from urllib.parse import urlparse
+                domain = urlparse(cand.page_url).netloc
+                if domain:
+                    blocked, reason = SitesHelper().check(domain)
+                    if blocked:
+                        self._log(f"站点流控中，跳过候选 {cand.site}: {str(reason)[:60]}")
+                        return b""
+            except Exception as err:  # noqa: BLE001
+                logger.debug(f"拆包辅种：站点流控检查不可用 {err}")
         url, recipe = self.__split_recipe(cand.enclosure or "")
         if not url:
             return b""
@@ -1082,7 +1124,7 @@ class PackCrossSeed(_PluginBase):
                 cache_invalid=False,
                 site_id=site_id,
             )
-            if content and not isinstance(content, str):
+            if content and not isinstance(content, str) and not self.__is_error_page(bytes(content)):
                 return bytes(content)
             if content and isinstance(content, str) and content.startswith("magnet:"):
                 self._log(f"{cand.site} 返回磁力链，无法做 piece 校验，跳过")
@@ -1104,6 +1146,9 @@ class PackCrossSeed(_PluginBase):
             return b""
         if not res or int(getattr(res, "status_code", 0) or 0) != 200 or not res.content:
             self._log(f"种子下载失败 {cand.site}: HTTP {getattr(res, 'status_code', '无响应')}")
+            return b""
+        if self.__is_error_page(bytes(res.content)):
+            self._log(f"种子下载返回错误页 {cand.site}{self.__explain_body(bytes(res.content))}")
             return b""
         return bytes(res.content)
 
@@ -1231,6 +1276,7 @@ class PackCrossSeed(_PluginBase):
         if not instance:
             return False
         kind = str(getattr(target, "type", "") or "").lower()
+        is_qb = kind.startswith("qb")
         # 按 infohash 判重，避免同一资源被重复添加
         hash_str = str(meta.get("infohash") or "").lower()
         if hash_str:
@@ -1238,6 +1284,8 @@ class PackCrossSeed(_PluginBase):
                 existing = instance.get_torrents(ids=[hash_str])
                 items = existing[0] if isinstance(existing, tuple) else existing
                 if items:
+                    # 已存在：若被暂停且已完整，恢复做种（猪猪/青蛙经验：加种前先看有没有被暂停的旧任务）
+                    self.__resume_if_paused(instance, kind, items, hash_str)
                     self._log(f"目标下载器已有该种子，跳过: {str(meta.get('name') or '')[:40]}")
                     return False
             except Exception as err:  # noqa: BLE001
@@ -1249,25 +1297,141 @@ class PackCrossSeed(_PluginBase):
             "is_paused": not self._auto_start,
             "download_dir": download_dir,
         }
-        # 标签 = 配置的通用标签 + 候选来源站点名（去空、去重、保序）
+        # 标签 = 配置的通用标签 + 候选来源站点名（去空、去重、保序）。
+        # qB 额外加一枚随机临时 tag，便于加种后用 get_torrent_id_by_tag 精确定位本次任务
+        # （借鉴 IYUU/青蛙：新任务索引有延迟，靠 hash 反查可能落空）。
         labels: List[str] = []
         for value in (self._label, str(site or "").strip()):
             if value and value not in labels:
                 labels.append(value)
+        trace_tag = ""
         if labels:
-            if kind.startswith("qb"):
-                # qB 的 tag 是逗号分隔的单个字符串
-                kwargs["tag"] = ",".join(labels)
+            if is_qb:
+                trace_tag = "pcs_" + datetime.now().strftime("%H%M%S%f")[-8:]
+                tags = labels + [trace_tag]
+                kwargs["tag"] = ",".join(tags)
+                # 强制关闭 qB 自动种子管理(ATM)：ATM 会用分类目录覆盖 download_dir，
+                # 让辅种落到别处、原种文件不被复用而表现为“文件丢失”（IYUU 踩过的坑）。
+                # ignore_category_check=False + category=None => 下载器侧 is_auto=False。
+                kwargs["ignore_category_check"] = False
+                kwargs["category"] = None
             else:
                 kwargs["labels"] = labels
         try:
-            instance.add_torrent(**kwargs)
-            ops.append(Operation("add_torrent", download_dir, meta.get("name", ""), "在下载器里删除对应任务"))
-            self._log(f"已加种: {meta.get('name','')[:50]}")
-            return True
+            ret = instance.add_torrent(**kwargs)
         except Exception as err:  # noqa: BLE001
             self._log(f"加种失败: {str(err)[:100]}")
             return False
+        # add_torrent 现版本返回 (bool, [ids])，旧版本可能只返回 bool/真值对象。
+        # 旧代码无条件判成功，会把失败也算成 seeded。这里兼容解析。
+        added_ok, added_ids = self.__parse_add_result(ret)
+        if not added_ok:
+            self._log(f"加种失败: 下载器返回失败 - {str(meta.get('name') or '')[:40]}")
+            return False
+        if not self._verify_after_add:
+            ops.append(Operation("add_torrent", download_dir, meta.get("name", ""), "在下载器里删除对应任务"))
+            self._log(f"已加种: {meta.get('name','')[:50]}")
+            return True
+
+        # --- 加种后复核：确认新任务的真实 hash/状态，防 add_torrent 返回旧任务陷阱 ---
+        live_id = self.__resolve_added_id(instance, kind, hash_str, added_ids, trace_tag)
+        if not live_id:
+            # 拿不到本次任务标识，无法确认，保守记为失败（宁可漏报也别误报做种）
+            self._log(f"加种后无法定位新任务，已加入下载器但不计成功: {str(meta.get('name') or '')[:40]}")
+            return False
+        live = self.__get_one_torrent(instance, live_id)
+        if live is None:
+            self._log(f"加种后查询任务失败: {str(meta.get('name') or '')[:40]}")
+            return False
+        live_hash = str(self.__attr(live, "hash", "hash_string", "hashString", default="") or "").lower()
+        # 若下载器回报的 hash 与目标不符，说明加错任务（极端情况下返回了旧任务）
+        if live_hash and hash_str and live_hash != hash_str:
+            self._log(f"加种复核 hash 不符（{live_hash[:8]} != {hash_str[:8]}），不计成功")
+            return False
+        # 触发 recheck，让 qB/TR 按硬链接副本做校验
+        try:
+            instance.recheck_torrents(ids=[live_id])
+        except Exception as err:  # noqa: BLE001
+            logger.warning(f"拆包辅种：触发 recheck 失败 {err}")
+        # 清理 qB 临时追踪 tag
+        if is_qb and trace_tag:
+            try:
+                instance.remove_torrents_tag(ids=[live_id], tag=[trace_tag])
+            except Exception:  # noqa: BLE001
+                pass
+        ops.append(Operation("add_torrent", download_dir, meta.get("name", ""), "在下载器里删除对应任务"))
+        self._log(f"已加种并触发校验: {meta.get('name','')[:50]}")
+        return True
+
+    @staticmethod
+    def __parse_add_result(ret: Any) -> Tuple[bool, List[str]]:
+        """兼容 add_torrent 的多种返回：新版本 (bool, [ids])、旧版本 bool/对象。"""
+        if isinstance(ret, tuple) and len(ret) >= 2:
+            ok = bool(ret[0])
+            raw = ret[1] or []
+            if isinstance(raw, str):
+                raw = [raw]
+            try:
+                ids = [str(x) for x in raw if x]
+            except TypeError:
+                ids = []
+            return ok, ids
+        # 非 tuple：真值即成功，但没有可用 id
+        return bool(ret), []
+
+    @staticmethod
+    def __get_one_torrent(instance: Any, torrent_id: str) -> Optional[Any]:
+        """按 id 精确取单个任务，兼容 get_torrents 的 tuple 包装。"""
+        try:
+            r = instance.get_torrents(ids=[torrent_id])
+            items = r[0] if isinstance(r, tuple) else r
+            if isinstance(items, (list, tuple)):
+                return items[0] if items else None
+            return items
+        except Exception:  # noqa: BLE001
+            return None
+
+    def __resolve_added_id(self, instance: Any, kind: str, hash_str: str,
+                           added_ids: List[str], trace_tag: str) -> str:
+        """确定本次新加任务的 id：优先下载器返回的 ids，其次 qB 临时 tag 反查。"""
+        for tid in added_ids:
+            if tid:
+                return tid
+        if trace_tag and str(kind).lower().startswith("qb"):
+            try:
+                tid = instance.get_torrent_id_by_tag(tags=trace_tag)
+                if tid:
+                    return str(tid)
+            except Exception as err:  # noqa: BLE001
+                logger.warning(f"拆包辅种：临时 tag 反查失败 {err}")
+        # 最后按目标 hash 反查（源任务也是这个 hash，但前面已判重排除，这里可接受）
+        if hash_str:
+            live = self.__get_one_torrent(instance, hash_str)
+            if live is not None:
+                return hash_str
+        return ""
+
+    def __resume_if_paused(self, instance: Any, kind: str, items: Any, hash_str: str) -> None:
+        """目标已有该种子且被暂停、进度已满时恢复做种（防加种陷阱留下的僵尸暂停任务）。"""
+        try:
+            item = items[0] if isinstance(items, (list, tuple)) and items else items
+            if not item:
+                return
+            done = self.__attr(item, "percent_done", "percentDone", "progress", default=0)
+            try:
+                done = float(done or 0)
+            except (TypeError, ValueError):
+                done = 0.0
+            state = str(self.__attr(item, "state", "status", default="") or "").lower()
+            is_paused = state in ("paused", "stopped") or bool(
+                self.__attr(item, "paused", default=False)
+            )
+            if done >= 0.999 and is_paused:
+                # 两个下载器模块都用 start_torrents（复数）
+                instance.start_torrents(ids=[hash_str])
+                self._log(f"已有任务被暂停且完整，已恢复做种: {hash_str[:12]}")
+        except Exception as err:  # noqa: BLE001
+            logger.warning(f"拆包辅种：恢复暂停任务失败 {err}")
 
     def __align_single_file(self, meta: dict, unit: Unit, ops: List[Operation]) -> None:
         """单文件种子：确保按种子内文件名在 output_dir 下有一份副本。
