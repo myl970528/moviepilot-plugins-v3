@@ -35,6 +35,7 @@ from .engine import (
     discover_units,
     episode_info,
     episodes_of_meta,
+    is_auxiliary,
     is_full_pack_title,
     materialize,
     parse_torrent,
@@ -52,13 +53,14 @@ _KEY_HISTORY = "pcs_history"     # 执行历史
 _KEY_OPS = "pcs_operations"      # 写操作 journal
 _KEY_UNIT_CACHE = "pcs_unit_cache"   # 单元级结论缓存：key -> {size, verdict, at}
 _KEY_BLOB_CACHE = "pcs_blob_cache"   # 候选种子文件缓存：site|title|size -> {b64, at}
+_KEY_HEALTH = "pcs_health"           # 最近一次做种健康巡查结果
 
 
 class PackCrossSeed(_PluginBase):
     plugin_name = "拆包辅种"
     plugin_desc = "整包按电影/单集拆分，跨站匹配独立种子并做 piece 校验，硬链接生成副本后辅种。原包不动。"
     plugin_icon = "package.png"
-    plugin_version = "1.2.4"
+    plugin_version = "1.2.6"
     plugin_author = "sdcsmyl"
     author_url = ""
     plugin_config_prefix = "packcrossseed_"
@@ -256,9 +258,8 @@ class PackCrossSeed(_PluginBase):
         return out
 
     def get_page(self) -> List[dict]:
-        """详情页：KPI + 当前计划 + 执行历史 + 说明。全部读本地缓存。"""
+        """详情页：KPI + 做种健康 + 执行历史 + 说明。全部读本地缓存。"""
         result = self.get_data(_KEY_RESULT) or {}
-        plan = self.get_data(_KEY_PLAN) or {}
         history = self.get_data(_KEY_HISTORY) or []
         if isinstance(history, dict):
             history = list(history.values())
@@ -303,39 +304,62 @@ class PackCrossSeed(_PluginBase):
             ],
         }]
 
-        # 当前计划（试跑预览）
-        units = plan.get("units") or []
-        if units:
-            rows: List[List[Tuple[str, str]]] = []
-            for i, u in enumerate(units[:25], 1):
-                rows.append([
-                    (str(i), "text-body-2 text-medium-emphasis"),
-                    (str(u.get("name") or "")[:44], "text-body-2"),
-                    (f"{int(u.get('size') or 0)/1024/1024/1024:.2f} GB", "text-body-2 text-no-wrap"),
-                    ("单集" if u.get("is_episode") else "电影", "text-body-2 text-center"),
-                    (str(u.get("candidates") or 0), "text-body-2 text-center"),
-                ])
-            heads = ["#", "单集 / 影片", "体积", "类型", "候选"]
-            table = [{
-                "component": "VTable", "props": {"density": "comfortable"},
-                "content": [
-                    {"component": "thead", "content": [{"component": "tr", "content": [
-                        {"component": "th", "props": {"class": "text-caption text-medium-emphasis"}, "text": t} for t in heads
-                    ]}]},
-                    {"component": "tbody", "content": [{"component": "tr", "content": [
-                        {"component": "td", "props": {"class": c}, "text": t} for t, c in row
-                    ]} for row in rows]},
-                ],
-            }]
-            page.append({"component": "VRow", "content": [{"component": "VCol", "props": {"cols": 12}, "content": [{
-                "component": "VCard", "props": {"variant": "tonal"}, "content": [
-                    {"component": "VCardTitle", "props": {"class": "d-flex align-center"}, "content": [
-                        {"component": "VIcon", "props": {"color": "primary", "class": "mr-2"}, "text": "mdi-format-list-bulleted"},
-                        {"component": "span", "text": f"当前试跑计划（最多 25 条，共 {len(units)} 条）"},
-                    ]},
-                    {"component": "VCardText", "props": {"class": "pa-2"}, "content": table},
-                ],
-            }]}]})
+        # 做种健康（最近一次巡查结果；只查本地，不访问站点）
+        health = self.get_data(_KEY_HEALTH) or {}
+        if isinstance(health, dict) and health.get("at"):
+            bad = int(health.get("missing") or 0) + int(health.get("unmounted") or 0) \
+                + int(health.get("tracker") or 0)
+            hk = [
+                ("mdi-heart-pulse", "做种健康", int(health.get("ok") or 0), "success",
+                 f"巡查 {health.get('total') or 0} 个 · 异常 {bad}"),
+                ("mdi-alert-circle-outline", "文件缺失", int(health.get("missing") or 0),
+                 "error", "任务声明的文件已不在磁盘"),
+                ("mdi-harddisk-remove", "存储未挂载", int(health.get("unmounted") or 0),
+                 "warning", "盘未挂载，未计为缺失"),
+                ("mdi-access-point-network-off", "tracker 异常",
+                 int(health.get("tracker") or 0), "deep-orange", "下载器回报 tracker 报错"),
+            ]
+            page.append({"component": "VRow", "props": {"dense": True},
+                         "content": [
+                             {"component": "VCol", "props": {"cols": 6, "md": 3},
+                              "content": [kpi(*hk[0])]},
+                             {"component": "VCol", "props": {"cols": 6, "md": 3},
+                              "content": [kpi(*hk[1])]},
+                             {"component": "VCol", "props": {"cols": 6, "md": 3},
+                              "content": [kpi(*hk[2])]},
+                             {"component": "VCol", "props": {"cols": 6, "md": 3},
+                              "content": [kpi(*hk[3])]},
+                         ]})
+            page.append({"component": "VAlert", "props": {
+                "type": "info", "variant": "tonal", "density": "compact",
+                "class": "mt-2",
+                "text": f"做种健康巡查于 {health.get('at')} 完成，共 {health.get('total')} 个做种任务"
+                        f"（{health.get('scope_detail') or '目录级检查'}）"
+                        + (f"；{health.get('note')}" if health.get("note") else ""),
+            }})
+            hitems = health.get("items") or []
+            if hitems:
+                hrows: List[List[Tuple[str, str]]] = []
+                for it in hitems[:20]:
+                    hrows.append([
+                        (str(it.get("state") or ""), "text-body-2"),
+                        (str(it.get("downloader") or ""), "text-body-2"),
+                        (str(it.get("task") or "")[:40], "text-body-2"),
+                        (f"×{int(it.get('hit_count') or 1)}", "text-body-2 text-center"),
+                        (str(it.get("detail") or "")[:60], "text-caption text-medium-emphasis"),
+                    ])
+                page.append({"component": "VTable", "props": {"density": "compact"},
+                             "content": [
+                                 {"component": "thead", "content": [{"component": "tr", "content": [
+                                     {"component": "th",
+                                      "props": {"class": "text-caption text-medium-emphasis"},
+                                      "text": t} for t in ["状态", "下载器", "任务", "影响", "说明"]
+                                 ]}]},
+                                 {"component": "tbody", "content": [{"component": "tr", "content": [
+                                     {"component": "td",
+                                      "props": {"class": cls}, "text": txt} for txt, cls in row
+                                 ]} for row in hrows]},
+                             ]})
 
         # 执行历史
         if history:
@@ -378,8 +402,9 @@ class PackCrossSeed(_PluginBase):
                 "type": "warning" if note else "info",
                 "variant": "tonal",
                 "text": note or (
-                    "使用顺序：① 保持试跑模式，点「扫描生成计划」看拆出哪些单元；"
-                    "② 点「执行一轮」看校验结果（不写盘）；③ 确认无误后关掉试跑模式再执行。"
+                    "使用顺序：先在配置里选好来源与目标下载器、填写副本输出目录；"
+                    "建议先开试跑模式点「执行一轮」看校验结果（不写盘），"
+                    "确认无误后关掉试跑模式再正式执行。"
                     "站点与下载器信息均从 MoviePilot 运行时读取，源码不保存任何个人信息。"
                 ),
             },
@@ -395,6 +420,7 @@ class PackCrossSeed(_PluginBase):
             {"path": "/stop", "endpoint": self.api_stop, "methods": ["POST"], "auth": "apikey", "summary": "停止当前一轮（处理完当前单元后退出）"},
             {"path": "/rollback", "endpoint": self.api_rollback, "methods": ["POST"], "auth": "apikey", "summary": "回滚上一轮的写操作"},
             {"path": "/clear_cache", "endpoint": self.api_clear_cache, "methods": ["POST"], "auth": "apikey", "summary": "清除增量缓存（单元结论与候选种子）"},
+            {"path": "/health", "endpoint": self.api_health, "methods": ["GET"], "auth": "apikey", "summary": "做种健康巡查（只查本地文件与 tracker，不访问站点）"},
         ]
 
     async def api_scan(self) -> dict:
@@ -459,6 +485,48 @@ class PackCrossSeed(_PluginBase):
         self.save_data(_KEY_BLOB_CACHE, {})
         return {"success": True,
                 "message": f"已清除增量缓存：单元结论 {nu} 条、候选种子 {nb} 条"}
+
+    async def api_health(self) -> dict:
+        """做种健康巡查：只读本地下载器与文件系统，不访问任何站点。"""
+        from . import seedhealth
+        downloaded: List[Tuple[Any, str]] = []
+        try:
+            services = DownloaderHelper().get_services() or {}
+        except Exception as err:  # noqa: BLE001
+            return {"success": False, "message": f"读取下载器失败：{err}"}
+        for name, info in services.items():
+            inst = getattr(info, "instance", None)
+            if not inst:
+                continue
+            try:
+                if getattr(inst, "is_inactive", lambda: False)():
+                    continue
+                torrents = inst.get_completed_torrents() or []
+            except Exception as err:  # noqa: BLE001
+                logger.warning(f"拆包辅种：巡查读取 {name} 失败 {err}")
+                continue
+            for t in torrents:
+                downloaded.append((t, str(name)))
+        report = seedhealth.build_report(
+            downloaded, self.__attr,
+            at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        )
+        # 最近一次巡查结果存起来，页面直接读缓存值
+        self.save_data(_KEY_HEALTH, {
+            "at": report.at, "total": report.total, "ok": report.ok,
+            "missing": report.missing, "unmounted": report.unmounted,
+            "tracker": report.tracker, "unknown": report.unknown,
+            "items": report.items, "note": report.note,
+            "scope": report.scope, "scope_detail": report.scope_detail,
+        })
+        return {
+            "success": True, "at": report.at, "total": report.total,
+            "ok": report.ok, "missing": report.missing,
+            "unmounted": report.unmounted, "tracker": report.tracker,
+            "unknown": report.unknown, "items": report.items,
+            "note": report.note, "scope": report.scope,
+            "scope_detail": report.scope_detail,
+        }
 
     # ================================================================ 任务编排
     def _scan_task(self) -> None:
@@ -927,13 +995,17 @@ class PackCrossSeed(_PluginBase):
                     f"候选集号 {sorted(cand_eps)} 非源 {sorted(src_eps)} 的真子集（整包/超集），跳过"
                 )
                 return False, cand.verify_reason
-        # 整包/合集候选：本地缺文件就没必要再做 piece 校验和物化。
-        # 否则每集都要下种子、逐条比对、最后才发现缺 43 集，白烧 IO 和日志。
+        # 整包/合集候选：本地缺正片文件就没必要再做 piece 校验和物化。
+        # 注意只统计「必需文件」——站点种子常附带 nfo/字幕/样图，本地拆出来
+        # 的通常只有视频，若把这些也算进来，带辅助文件的种子会被整批拒掉。
         base = os.path.dirname(unit.source_path)
-        need = len(meta.get("files") or [])
+        required = [f for f in (meta.get("files") or []) if not is_auxiliary(
+            os.path.join(*f["path"]) if f.get("path") else str(meta.get("name") or "")
+        ) and not f.get("padding")]
+        need = len(required)
         if need > 1:
             have = 0
-            for f in meta["files"]:
+            for f in required:
                 rel = os.path.join(*f["path"]) if f["path"] else ""
                 paths = [os.path.join(base, rel), os.path.join(base, os.path.basename(rel))]
                 if any(p and os.path.exists(p) for p in paths):
@@ -946,7 +1018,7 @@ class PackCrossSeed(_PluginBase):
                     have += 1
             if have < need:
                 cand.verify_reason = (
-                    f"站点是 {need} 个文件的{'整包' if need > 4 else '合集'}，"
+                    f"站点是 {need} 个正片文件的{'整包' if need > 4 else '合集'}，"
                     f"本地只有 {have} 个，跳过"
                 )
                 return False, cand.verify_reason
@@ -973,41 +1045,112 @@ class PackCrossSeed(_PluginBase):
     def __build_local_map(self, meta: dict, unit: Unit) -> Dict[str, str]:
         """把候选种子里的文件映射到本地实际文件，供 span 校验使用。
 
-        目标集用 unit.source_path 直接钉死；其余集在源目录里按 (季,集)+体积
-        找同名/同集文件（走 __local_episode_index，跨发布组也能对上）。
-        只映射「本地存在且体积与种子声明一致」的文件，避免把不同版本
-        错算成内容不符。
+        映射必须确定：**体积先精确相等**，再按 精确文件名 → 季集号 → 唯一同体积
+        的顺序判定；任何一步出现多个并列候选即视为「歧义」，宁可不映射也不猜
+        （猜错会拿别的集去校验，既浪费 IO 又可能得出错误结论）。
+        一个本地文件最多映射给一个种子文件。
         """
         out: Dict[str, str] = {}
         files = meta.get("files") or []
         base = os.path.dirname(unit.source_path)
-        target_size = os.path.getsize(unit.source_path) if os.path.exists(unit.source_path) else 0
-        index = None
+
+        # 本地候选池：源目录里能识别出文件的 + 目标集本身
+        pool: List[Tuple[str, int]] = []
+        try:
+            index = self.__local_episode_index(base)
+            for items in index.values():
+                pool.extend(items)
+        except Exception:  # noqa: BLE001
+            index = {}
+        if os.path.exists(unit.source_path):
+            try:
+                pool.append((unit.source_path, os.path.getsize(unit.source_path)))
+            except OSError:
+                pass
+        seen: set = set()
+        uniq: List[Tuple[str, int]] = []
+        for p, s in pool:
+            if p in seen:
+                continue
+            seen.add(p)
+            uniq.append((p, int(s)))
+
+        used: set = set()
+
+        # 目标集优先：先把 unit.source_path 绑到「集号相同且体积相等」的种子文件上。
+        # 这是拆包辅种的主路径，必须优先确定，不能因为目录里还有别的同体积文件
+        # 就被判成歧义（那会把本来能校验的候选全部丢掉）。
+        try:
+            target_size = os.path.getsize(unit.source_path) if os.path.exists(unit.source_path) else 0
+        except OSError:
+            target_size = 0
+        if target_size:
+            target_key = ""
+            # ① 集号相同的种子文件
+            if unit.episode:
+                for f in files:
+                    rel_key = "/".join(f["path"]) if f.get("path") else str(meta.get("name") or "")
+                    if int(f.get("length") or 0) != target_size or f.get("padding"):
+                        continue
+                    _s, _e, is_ep = episode_info(os.path.basename(rel_key))
+                    if is_ep and _e == unit.episode:
+                        target_key = rel_key
+                        break
+            # ② 只有一个同体积文件时用它
+            if not target_key:
+                same_len = [
+                    "/".join(f["path"]) if f.get("path") else str(meta.get("name") or "")
+                    for f in files
+                    if int(f.get("length") or 0) == target_size and not f.get("padding")
+                ]
+                if len(same_len) == 1:
+                    target_key = same_len[0]
+            if target_key:
+                out[target_key] = unit.source_path
+                used.add(unit.source_path)
+
+        def pick(items: List[Tuple[str, int]]) -> str:
+            """唯一命中才返回路径；零个或多个都返回空（多个=歧义，不猜）。"""
+            if len(items) == 1:
+                return items[0][0]
+            return ""
+
         for f in files:
-            rel = os.path.join(*f["path"]) if f.get("path") else str(meta.get("name") or "")
             rel_key = "/".join(f["path"]) if f.get("path") else str(meta.get("name") or "")
             length = int(f.get("length") or 0)
             if f.get("padding") or length == 0:
                 continue
-            # ① 目标集：体积吻合直接钉
-            if target_size and length == target_size and rel_key not in out:
-                out[rel_key] = unit.source_path
+            if rel_key in out:
                 continue
-            # ② 其余集：按季集号 + 体积在源目录找
-            _s, _e, is_ep = episode_info(os.path.basename(rel))
-            if not is_ep or not _e:
+            # 体积必须精确相等：体积不同绝不可能是同一文件
+            same = [(p, s) for p, s in uniq if s == length and p not in used]
+            if not same:
                 continue
-            if index is None:
-                index = self.__local_episode_index(base)
-            for (season, ep), items in index.items():
-                if ep != _e:
+            # ① 文件名精确相同
+            want_name = os.path.basename(rel_key)
+            exact = [(p, s) for p, s in same if os.path.basename(p) == want_name]
+            hit = pick(exact)
+            if hit:
+                out[rel_key] = hit
+                used.add(hit)
+                continue
+            # ② 季集号相同
+            _s, _e, is_ep = episode_info(want_name)
+            if is_ep and _e:
+                ep_hit = [(p, s) for p, s in same
+                          if episode_info(os.path.basename(p))[1] == _e]
+                hit = pick(ep_hit)
+                if hit:
+                    out[rel_key] = hit
+                    used.add(hit)
                     continue
-                for path, size in items:
-                    if size == length and rel_key not in out:
-                        out[rel_key] = path
-                        break
-                if rel_key in out:
-                    break
+            # ③ 同体积只有一个，才敢用
+            hit = pick(same)
+            if hit:
+                out[rel_key] = hit
+                used.add(hit)
+                continue
+            # 多个并列 → 歧义，跳过（该文件按缺失处理，校验时判不可用）
         return out
 
     @staticmethod
@@ -1584,6 +1727,19 @@ class PackCrossSeed(_PluginBase):
         if live_hash and hash_str and live_hash != hash_str:
             self._log(f"加种复核 hash 不符（{live_hash[:8]} != {hash_str[:8]}），不计成功")
             return False
+        # 复核保存路径：下载器实际落位必须等于我们给的 download_dir。
+        # qB 的自动种子管理(ATM)或分类目录可能把它改到别处，那样副本文件不被
+        # 复用，表现为「加进去了但一直 0%」。
+        live_save = str(self.__attr(live, "save_path", "download_dir", "downloadDir",
+                                    default="") or "")
+        if live_save and download_dir:
+            a = live_save.rstrip("/")
+            b = str(download_dir).rstrip("/")
+            if a != b:
+                self._log(
+                    f"加种复核 save_path 不一致（{a} != {b}），"
+                    f"副本可能不被复用，请检查下载器自动管理/分类设置"
+                )
         # 触发 recheck，让 qB/TR 按硬链接副本做校验
         try:
             instance.recheck_torrents(ids=[live_id])

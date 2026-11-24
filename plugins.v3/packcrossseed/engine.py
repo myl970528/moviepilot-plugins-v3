@@ -58,6 +58,14 @@ EPISODE_PATTERNS = [
     re.compile(r"\bEP?\.?\s?(\d{1,4})\b", re.I),
     re.compile(r"第\s*(\d{1,4})\s*集"),
 ]
+# 辅助文件：不属于正片内容的小文件（说明、字幕、样图等）。
+# 站点种子常把它们打包进去，而本地拆出来的通常只有视频文件。
+# 这类文件缺失不该判「内容不符」，也不该阻止加种——下载器可以补，或只补这几个文件。
+AUXILIARY_EXT = {
+    ".nfo", ".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp",
+    ".srt", ".ass", ".ssa", ".sub", ".idx", ".sup", ".vtt",
+    ".txt", ".md", ".url", ".lnk", ".sfv", ".md5",
+}
 
 
 @dataclass
@@ -122,6 +130,11 @@ def normalize(text: str) -> str:
 
 def _is_video(name: str) -> bool:
     return Path(str(name)).suffix.lower() in VIDEO_EXT
+
+
+def is_auxiliary(name: str) -> bool:
+    """是否辅助文件（说明/字幕/样图等）。辅助文件缺失不算内容不符。"""
+    return Path(str(name)).suffix.lower() in AUXILIARY_EXT
 
 
 def _is_segment(name: str) -> bool:
@@ -673,15 +686,65 @@ def screen_candidates(
             ua=str(item.get("ua") or ""),
             referer=str(item.get("referer") or ""),
         ))
-    # 排序：单集优先 → 版本特征（分辨率/编码/来源）重合多优先 → 体积接近 → 名称相似
-    u_tags = release_tags(unit.name)
+    # 排序：单集候选优先（拆包场景最可能命中）→ 加权评分从高到低。
+    # 评分维度不可比较时不计入分母，避免信息少的候选被莫名压低。
     out.sort(key=lambda c: (
         0 if episode_info(c.title)[2] else 1,
-        -len(u_tags & release_tags(c.title)),
-        abs(c.size - unit.size),
-        -similarity(unit.search_keyword, c.title),
+        -score_candidate(unit, c.title, c.size),
     ))
     return out[:max_candidates]
+
+
+def score_candidate(unit: "Unit", title: str, size: int) -> float:
+    """给一个候选打分（0~100）。只用于排序，通过与否仍由 piece 校验决定。
+
+    维度与权重：
+      集号匹配 30 / 体积接近 30 / 发布属性重合 25 / 名称相似 15
+    每维只有在「可比较」时才计入分母，避免信息缺失把总分压低。
+    """
+    earned = 0.0
+    maximum = 0.0
+
+    # 集号匹配
+    c_season, c_episode, c_is_episode = episode_info(title)
+    want_ep = unit.episode if unit.is_episode else 0
+    if want_ep:
+        maximum += 30
+        if c_is_episode and c_episode == want_ep:
+            same_season = not (unit.season and c_season and c_season != unit.season)
+            earned += 30 if same_season else 20
+        elif not c_is_episode:
+            # 整包：体积能容纳这一集才给部分分
+            if size >= unit.size:
+                earned += 15
+
+    # 体积接近（相对差异越小分越高）
+    if unit.size > 0 and size > 0:
+        maximum += 30
+        denom = max(unit.size, size)
+        diff = abs(unit.size - size) / denom if denom else 1.0
+        # 差异 0 -> 满分；差异 >= 20% -> 0 分
+        ratio = max(0.0, 1.0 - diff / 0.20)
+        earned += 30 * ratio
+
+    # 发布属性重合（分辨率/编码/来源等标签）
+    u_tags = release_tags(unit.name)
+    c_tags = release_tags(title)
+    if u_tags and c_tags:
+        maximum += 25
+        union = u_tags | c_tags
+        if union:
+            earned += 25 * (len(u_tags & c_tags) / len(union))
+
+    # 名称相似
+    sim = similarity(unit.search_keyword, title)
+    if sim > 0:
+        maximum += 15
+        earned += 15 * sim
+
+    if maximum <= 0:
+        return 0.0
+    return round(earned * 100 / maximum, 3)
 
 
 def same_episode(title: str, season: int, episode: int) -> bool:
@@ -1284,6 +1347,30 @@ def size_of_meta(meta: Dict[str, Any]) -> int:
 
 # ---------------------------------------------------------------- 物化
 
+def _verify_placement_identity(action: str, src: str, dst: str) -> str:
+    """校验落位副本与源文件的身份关系，返回空串表示通过。
+
+    - hardlink：必须与源共用同一 inode（同 inode 才是真硬链，否则占额外空间）
+    - copy：必须与源不同 inode（共用 inode 意味着其实是硬链，下载器写入会破坏源）
+    - symlink：目标应是指向源的符号链接
+    """
+    try:
+        s_stat = os.stat(src, follow_symlinks=False)
+        d_stat = os.lstat(dst)
+    except OSError as err:
+        return f"无法读取状态 {err}"
+    if action == "symlink":
+        if not os.path.islink(dst):
+            return "期望符号链接但不是"
+        return ""
+    same = (s_stat.st_dev == d_stat.st_dev) and (s_stat.st_ino == d_stat.st_ino)
+    if action == "hardlink" and not same:
+        return "硬链落位后 inode 与源不同（可能被降级成复制）"
+    if action == "copy" and same:
+        return "复制落位后与源共用 inode，下载器写入会破坏源文件"
+    return ""
+
+
 def _ensure_dir(path: str) -> None:
     """建目录并把权限显式设成 755。
 
@@ -1369,6 +1456,11 @@ def materialize(
                 if resolved and os.path.exists(resolved):
                     src = resolved
         if not src or not os.path.exists(src):
+            if is_auxiliary(rel):
+                # 辅助文件（nfo/字幕/样图）本地没有很正常：不阻止加种，
+                # 下载器会按需补齐，或用户可只补这几个文件。只记一条日志。
+                log(f"辅助文件本地缺失，不阻止加种: {os.path.basename(rel)}")
+                continue
             log(f"物化跳过（源文件不存在）: {rel}")
             missing.append(rel)
             continue
@@ -1387,17 +1479,18 @@ def materialize(
                 missing.append(rel)
                 continue
         done = False
+        action = ""
         if mode in ("hardlink", "auto"):
             try:
                 os.link(src, dst)
-                ops.append(Operation("hardlink", dst, src, f"unlink {dst}"))
+                action = "hardlink"
                 done = True
             except OSError:
                 pass
         if not done and mode in ("symlink", "auto"):
             try:
                 os.symlink(src, dst)
-                ops.append(Operation("symlink", dst, src, f"unlink {dst}"))
+                action = "symlink"
                 done = True
             except OSError:
                 pass
@@ -1407,7 +1500,21 @@ def materialize(
                 os.chmod(dst, 0o644)
             except OSError:
                 pass
-            ops.append(Operation("copy", dst, src, f"unlink {dst}"))
+            action = "copy"
+            done = True
+        # 落位后验证身份：硬链必须与源共用 inode；复制必须是独立 inode。
+        # 若复制模式却共用 inode，说明实际做成了硬链——下载器一旦写入会连带
+        # 破坏源文件（源文件本应只读），必须拦下。
+        verify_err = _verify_placement_identity(action, src, dst)
+        if verify_err:
+            log(f"落位身份校验失败 {rel}: {verify_err}")
+            try:
+                os.unlink(dst)
+            except OSError:
+                pass
+            missing.append(rel)
+            continue
+        ops.append(Operation(action, dst, src, f"unlink {dst}"))
         created.append(dst)
 
     if missing:
