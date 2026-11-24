@@ -49,13 +49,15 @@ _KEY_PLAN = "pcs_plan"           # 当前试跑计划
 _KEY_RESULT = "pcs_result"       # 上轮结果
 _KEY_HISTORY = "pcs_history"     # 执行历史
 _KEY_OPS = "pcs_operations"      # 写操作 journal
+_KEY_UNIT_CACHE = "pcs_unit_cache"   # 单元级结论缓存：key -> {size, verdict, at}
+_KEY_BLOB_CACHE = "pcs_blob_cache"   # 候选种子文件缓存：site|title|size -> {b64, at}
 
 
 class PackCrossSeed(_PluginBase):
     plugin_name = "拆包辅种"
     plugin_desc = "整包按电影/单集拆分，跨站匹配独立种子并做 piece 校验，硬链接生成副本后辅种。原包不动。"
     plugin_icon = "package.png"
-    plugin_version = "1.2.2"
+    plugin_version = "1.2.3"
     plugin_author = "sdcsmyl"
     author_url = ""
     plugin_config_prefix = "packcrossseed_"
@@ -92,6 +94,10 @@ class PackCrossSeed(_PluginBase):
     _verify_after_add: bool = True
     # 下载种子前检查站点流控，命中则跳过该候选（借鉴 IYUU 的 sites_helper.check）
     _check_site_flow: bool = True
+    # 增量缓存：记住每个单元的结论，下轮跳过已辅种/已失败的单元，避免每轮全量重跑
+    _use_cache: bool = True
+    # 缓存有效期（天）：失败的结论过期后会重试（站点可能新发种），成功的长期有效
+    _cache_days: int = 7
     _notify: bool = True
     _cron: str = ""
     _auto_mode: bool = False
@@ -103,6 +109,8 @@ class PackCrossSeed(_PluginBase):
     _search_cache: Dict[str, List[dict]] = {}
     _ep_index: Dict[str, Dict[Any, List[Tuple[str, int]]]] = {}
     _all_instances: List[Any] = []
+    # 本轮候选种子 blob 缓存（run_once 里从持久化加载，结束时写回）
+    _blob_cache: Dict[str, dict] = {}
     _stop_flag: bool = False
     _lock = threading.Lock()
     _progress: Dict[str, Any] = {}
@@ -135,6 +143,8 @@ class PackCrossSeed(_PluginBase):
             self._auto_start = bool(config.get("auto_start", True))
             self._verify_after_add = bool(config.get("verify_after_add", True))
             self._check_site_flow = bool(config.get("check_site_flow", True))
+            self._use_cache = bool(config.get("use_cache", True))
+            self._cache_days = self.__as_int(config.get("cache_days"), 7)
             self._notify = bool(config.get("notify", True))
             self._cron = str(config.get("cron") or "").strip()
             self._auto_mode = bool(config.get("auto_mode"))
@@ -210,6 +220,8 @@ class PackCrossSeed(_PluginBase):
             "auto_start": self._auto_start,
             "verify_after_add": self._verify_after_add,
             "check_site_flow": self._check_site_flow,
+            "use_cache": self._use_cache,
+            "cache_days": self._cache_days,
             "notify": self._notify,
             "cron": self._cron,
             "auto_mode": self._auto_mode,
@@ -274,7 +286,7 @@ class PackCrossSeed(_PluginBase):
             ("mdi-package-variant", "发现单元", int(result.get("units") or 0), "primary",
              f"来源任务 {result.get('tasks') or 0} 个"),
             ("mdi-magnify", "校验通过", int(result.get("verified") or 0), "info",
-             f"已有 {int(result.get('dup') or 0)} · 候选 {result.get('candidates') or 0} 个"),
+             f"已有 {int(result.get('dup') or 0)} · 缓存跳 {int(result.get('cached') or 0)} · 候选 {result.get('candidates') or 0} 个"),
             ("mdi-file-link", "已物化副本", int(result.get("materialized") or 0), "success",
              "硬链优先，源文件只读"),
             ("mdi-upload-network", "已加种", int(result.get("seeded") or 0), "warning",
@@ -381,6 +393,7 @@ class PackCrossSeed(_PluginBase):
             {"path": "/status", "endpoint": self.api_status, "methods": ["GET"], "auth": "apikey", "summary": "查询状态与进度"},
             {"path": "/stop", "endpoint": self.api_stop, "methods": ["POST"], "auth": "apikey", "summary": "停止当前一轮（处理完当前单元后退出）"},
             {"path": "/rollback", "endpoint": self.api_rollback, "methods": ["POST"], "auth": "apikey", "summary": "回滚上一轮的写操作"},
+            {"path": "/clear_cache", "endpoint": self.api_clear_cache, "methods": ["POST"], "auth": "apikey", "summary": "清除增量缓存（单元结论与候选种子）"},
         ]
 
     async def api_scan(self) -> dict:
@@ -434,6 +447,17 @@ class PackCrossSeed(_PluginBase):
                 logger.warning(f"拆包辅种：回滚失败 {target} {err}")
         self.save_data(_KEY_OPS, [])
         return {"success": True, "message": f"已清理 {removed} 个新副本（下载器任务需手动删除）"}
+
+    async def api_clear_cache(self) -> dict:
+        """清除增量缓存，下一轮恢复全量扫描。"""
+        unit_cache = self.get_data(_KEY_UNIT_CACHE) or {}
+        blob_cache = self.get_data(_KEY_BLOB_CACHE) or {}
+        nu = len(unit_cache) if isinstance(unit_cache, dict) else 0
+        nb = len(blob_cache) if isinstance(blob_cache, dict) else 0
+        self.save_data(_KEY_UNIT_CACHE, {})
+        self.save_data(_KEY_BLOB_CACHE, {})
+        return {"success": True,
+                "message": f"已清除增量缓存：单元结论 {nu} 条、候选种子 {nb} 条"}
 
     # ================================================================ 任务编排
     def _scan_task(self) -> None:
@@ -490,10 +514,13 @@ class PackCrossSeed(_PluginBase):
         stats: Dict[str, Any] = {
             "units": 0, "tasks": 0, "candidates": 0, "verified": 0,
             "materialized": 0, "seeded": 0, "failed": 0, "dup": 0,
+            "cached": 0,
             "mode": "试跑" if self._dry_run else "执行",
             "message": "",
         }
         ops_new: List[dict] = []
+        unit_cache: Dict[str, dict] = {}
+        blob_cache: Dict[str, dict] = {}
         try:
             # --- 1. 发现
             self._progress = {"phase": "发现", "done": 0, "total": 0}
@@ -514,12 +541,31 @@ class PackCrossSeed(_PluginBase):
             if not self._dry_run and target is None:
                 raise RuntimeError("找不到加种下载器，请检查配置")
 
+            # 加载增量缓存（试跑模式下不读也不写，保证试跑始终全量看真实情况）
+            if self._use_cache and not self._dry_run:
+                unit_cache = self.__load_unit_cache()
+                blob_cache = self.get_data(_KEY_BLOB_CACHE) or {}
+                if not isinstance(blob_cache, dict):
+                    blob_cache = {}
+                if unit_cache:
+                    self._log(f"增量缓存: 已载入 {len(unit_cache)} 条单元结论")
+            self._blob_cache = blob_cache
+
             for i, unit in enumerate(units, 1):
                 if self._stop_flag:
                     stats["message"] = f"已手动停止，剩余 {len(units) - i + 1} 个单元未处理"
                     self._log(stats["message"])
                     break
                 self._progress["done"] = i
+                # 命中缓存直接跳过：已辅种 / 目标已存在 / 无候选 / 校验不过，下轮不再重跑
+                cached_verdict = self.__unit_cache_get(unit_cache, unit)
+                if cached_verdict:
+                    stats["cached"] += 1
+                    if cached_verdict in ("seeded", "dup"):
+                        stats["dup"] += 1
+                    if self._debug:
+                        self._log(f"  缓存命中跳过 {unit.name[:36]}: {cached_verdict}")
+                    continue
                 try:
                     raw = self.__search(unit)
                     cands = screen_candidates(
@@ -541,6 +587,8 @@ class PackCrossSeed(_PluginBase):
                                 f"{item.site[:10]} {item.title[:48]}"
                             )
                     if not cands:
+                        # 无候选：站点当下确实没有，缓存一个短结论，过期后自动重试
+                        self.__unit_cache_put(unit_cache, unit, "nomatch")
                         continue
                     best: Optional[Candidate] = None
                     for cand in cands:
@@ -551,6 +599,8 @@ class PackCrossSeed(_PluginBase):
                             best = cand
                             break
                     if not best:
+                        # 有候选但校验不过（版本不同/合集缺文件）：同样缓存，下轮不再白费请求
+                        self.__unit_cache_put(unit_cache, unit, "noveri")
                         continue
                     stats["verified"] += 1
 
@@ -562,9 +612,11 @@ class PackCrossSeed(_PluginBase):
                     meta = parse_torrent(seed_blob)
                     if not meta:
                         stats["failed"] += 1
+                        self.__unit_cache_put(unit_cache, unit, "noveri")
                         continue
                     if self.__is_duplicate(target, meta):
                         stats["dup"] += 1
+                        self.__unit_cache_put(unit_cache, unit, "dup")
                         self._log(f"  目标下载器已有该种子，跳过: {unit.name[:40]}")
                         continue
 
@@ -592,6 +644,7 @@ class PackCrossSeed(_PluginBase):
                             f"加进去会一直校验失败，跳过"
                         )
                         stats["failed"] += 1
+                        self.__unit_cache_put(unit_cache, unit, "noveri")
                         continue
                     # unit 源文件名可能与种子内文件名不同，修正硬链接
                     self.__align_single_file(meta, unit, ops)
@@ -602,9 +655,16 @@ class PackCrossSeed(_PluginBase):
                     # --- 5. 加种（带上候选来源站点名，作为第二个标签）
                     if self.__add_torrent(target, seed_blob, meta, ops, site=best.site):
                         stats["seeded"] += 1
+                        self.__unit_cache_put(unit_cache, unit, "seeded")
                 except Exception as err:  # noqa: BLE001
                     stats["failed"] += 1
+                    # 异常不写缓存，下一轮允许重试
                     logger.warning(f"拆包辅种：处理 {unit.name[:40]} 失败 {err}")
+
+            # 持久化增量缓存：单元结论 + 候选 blob（都做过期/容量清理）
+            if self._use_cache and not self._dry_run:
+                self.save_data(_KEY_UNIT_CACHE, self.__prune_unit_cache(unit_cache))
+                self.save_data(_KEY_BLOB_CACHE, self.__prune_blob_cache(blob_cache))
 
             if ops_new:
                 self.save_data(_KEY_OPS, ops_new)
@@ -634,7 +694,8 @@ class PackCrossSeed(_PluginBase):
                 self.post_message(
                     title="拆包辅种 · 运行完成",
                     text=(f"单元 {stats['units']} · 校验通过 {stats['verified']} · "
-                          f"已有 {stats['dup']} · 物化 {stats['materialized']} · "
+                          f"已缓存跳过 {stats['cached']} · 已有 {stats['dup']} · "
+                          f"物化 {stats['materialized']} · "
                           f"加种 {stats['seeded']} · 耗时 {stats['elapsed']}s"
                           + (f"\n{stats['message']}" if stats["message"] else "")),
                 )
@@ -834,7 +895,14 @@ class PackCrossSeed(_PluginBase):
 
     def __verify_candidate(self, unit: Unit, cand: Candidate) -> Tuple[bool, str]:
         """下载候选种子 → 解析 → piece 校验本地单集文件。"""
-        blob = self.__download_torrent(cand)
+        # 候选种子文件缓存：同一个候选不重复下载（省站点请求，尤其馒头换票）
+        blob = self.__blob_cache_get(cand)
+        if blob:
+            cand.verify_reason = "命中种子缓存"
+        else:
+            blob = self.__download_torrent(cand)
+            if blob:
+                self.__blob_cache_put(cand, blob, self._blob_cache)
         if not blob:
             cand.verify_reason = "种子下载失败"
             return False, cand.verify_reason
@@ -1236,6 +1304,128 @@ class PackCrossSeed(_PluginBase):
             pass
         self._ep_index[base] = index
         return index
+
+    # ---------------------------------------------------------------- 增量缓存
+    # 三类缓存合起来解决「每轮全量重跑」：
+    #   1) 单元结论缓存：记住每个单元上一轮的结论（已辅种 / 已存在 / 无候选 / 校验不过），
+    #      下轮直接跳过，机制同 IYUU 的 success/error 缓存。
+    #   2) 候选种子 blob 缓存：同一个候选种子文件不重复下载，省站点请求。
+    # 失败类结论带 TTL（站点可能后来新发种），成功类结论也带 TTL 兜底（用户可能删了目标种子）。
+
+    def __cache_ttl(self, verdict: str) -> float:
+        """不同结论的有效期（秒）。失败类用配置天数，成功类给更长兜底。"""
+        days = max(1, int(self._cache_days or 7))
+        if verdict in ("seeded", "dup"):
+            # 已辅种/已存在：给 3 倍兜底，避免用户删了目标种子后永远不再辅
+            return days * 3 * 86400
+        return days * 86400
+
+    def __load_unit_cache(self) -> Dict[str, dict]:
+        raw = self.get_data(_KEY_UNIT_CACHE) or {}
+        return raw if isinstance(raw, dict) else {}
+
+    def __unit_cache_get(self, cache: Dict[str, dict], unit: Unit) -> Optional[str]:
+        """命中则返回 verdict；未命中/已过期/体积不符返回 None。"""
+        if not self._use_cache:
+            return None
+        item = cache.get(unit.key)
+        if not isinstance(item, dict):
+            return None
+        # 同路径换了内容（体积变了）视为不同单元，缓存失效
+        try:
+            if int(item.get("size") or 0) != int(unit.size or 0):
+                return None
+        except (TypeError, ValueError):
+            return None
+        verdict = str(item.get("verdict") or "")
+        try:
+            at = float(item.get("at") or 0)
+        except (TypeError, ValueError):
+            at = 0.0
+        if not verdict or not at:
+            return None
+        if time.time() - at > self.__cache_ttl(verdict):
+            return None
+        return verdict
+
+    def __unit_cache_put(self, cache: Dict[str, dict], unit: Unit, verdict: str) -> None:
+        if not verdict:
+            return
+        cache[unit.key] = {"size": int(unit.size or 0), "verdict": verdict, "at": time.time()}
+
+    def __prune_unit_cache(self, cache: Dict[str, dict]) -> Dict[str, dict]:
+        """清理过期项并限制总量，防止数据无限增长。"""
+        now = time.time()
+        out: Dict[str, dict] = {}
+        for k, v in cache.items():
+            if not isinstance(v, dict):
+                continue
+            verdict = str(v.get("verdict") or "")
+            try:
+                at = float(v.get("at") or 0)
+            except (TypeError, ValueError):
+                continue
+            if not verdict or now - at > self.__cache_ttl(verdict):
+                continue
+            out[k] = v
+        # 上限 20000 条，超了按时间淘汰最旧的
+        if len(out) > 20000:
+            items = sorted(out.items(), key=lambda kv: float(kv[1].get("at") or 0), reverse=True)
+            out = dict(items[:20000])
+        return out
+
+    def __blob_key(self, cand: Candidate) -> str:
+        return f"{cand.site}|{cand.title}|{int(cand.size or 0)}"
+
+    def __blob_cache_get(self, cand: Candidate) -> bytes:
+        """从内存缓存取候选种子。run_once 已把持久化内容加载到 self._blob_cache，
+        这里不再每次读库（否则每个候选都要读一次 plugin_data，累积可观）。"""
+        if not self._use_cache:
+            return b""
+        cache = self._blob_cache if isinstance(self._blob_cache, dict) else {}
+        item = cache.get(self.__blob_key(cand))
+        if not isinstance(item, dict):
+            return b""
+        try:
+            at = float(item.get("at") or 0)
+        except (TypeError, ValueError):
+            return b""
+        if time.time() - at > max(1, int(self._cache_days or 7)) * 86400:
+            return b""
+        import base64
+        try:
+            return base64.b64decode(item.get("b64") or "")
+        except Exception:  # noqa: BLE001
+            return b""
+
+    def __blob_cache_put(self, cand: Candidate, blob: bytes, cache: Dict[str, dict]) -> None:
+        """写 blob 缓存。只缓存真种子（bencode 字典），单条上限 512KB，总量上限 500 条。"""
+        if not self._use_cache or not blob or blob[:1] != b"d" or len(blob) > 512 * 1024:
+            return
+        import base64
+        cache[self.__blob_key(cand)] = {
+            "b64": base64.b64encode(blob).decode("ascii"),
+            "at": time.time(),
+        }
+
+    def __prune_blob_cache(self, cache: Dict[str, dict]) -> Dict[str, dict]:
+        now = time.time()
+        ttl = max(1, int(self._cache_days or 7)) * 86400
+        out: Dict[str, dict] = {}
+        for k, v in cache.items():
+            if not isinstance(v, dict):
+                continue
+            try:
+                at = float(v.get("at") or 0)
+            except (TypeError, ValueError):
+                continue
+            if now - at > ttl:
+                continue
+            out[k] = v
+        if len(out) > 500:
+            items = sorted(out.items(), key=lambda kv: float(kv[1].get("at") or 0), reverse=True)
+            out = dict(items[:500])
+        return out
 
     def __is_duplicate(self, target: Any, meta: dict) -> bool:
         """任一已配置下载器里是否已有这个种子。

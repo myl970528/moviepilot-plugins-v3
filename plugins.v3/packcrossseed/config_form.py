@@ -220,6 +220,15 @@ def build_form(
                                       hint="开启后下载种子前查询站点流控状态，命中则跳过该候选，避免频繁访问触发站点限制",
                                       persistent_hint=True)),
                     ]),
+                    row([
+                        col(6, switch("use_cache", "启用增量缓存", "indigo",
+                                      hint="记住每个单元上一轮的结论（已辅种/已存在/无候选/校验不过）与候选种子文件，下轮直接跳过，避免每轮全量重跑；试跑模式始终全量",
+                                      persistent_hint=True)),
+                        col(6, textfield("cache_days", "失败结论缓存天数",
+                                         type="number",
+                                         hint="搜不到/校验不过的结论保留天数，过期后重试（站点可能后来新发种）；已辅种/已存在的按 3 倍天数兜底",
+                                         persistent_hint=True)),
+                    ]),
                 ]),
 
                 # ── 定时与调试 ──
@@ -275,6 +284,8 @@ def build_form(
         "auto_start": True,
         "verify_after_add": True,
         "check_site_flow": True,
+        "use_cache": True,
+        "cache_days": 7,
         "notify": True,
         "cron": "",
         "auto_mode": False,
