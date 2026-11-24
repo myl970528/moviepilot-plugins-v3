@@ -276,8 +276,102 @@ def is_full_pack_title(title: str, source_episode_count: int) -> bool:
     return False
 
 
+# ---------------------------------------------------------------- bencode / Merkle
+# 自己实现 bencode 解析与 v2 Merkle，避免依赖宿主可能缺失的第三方库，
+# 也让 padding / zero-length / file tree 这些细节可控。
+
+
+def bdecode(data: bytes, pos: int = 0) -> Tuple[Any, int]:
+    """最小 bencode 解析器，返回 (值, 新位置)。bytes 保持 bytes，不转字符串。"""
+    if pos >= len(data):
+        raise ValueError("bencode 越界")
+    ch = data[pos:pos + 1]
+    if ch == b"i":
+        end = data.index(b"e", pos)
+        return int(data[pos + 1:end]), end + 1
+    if ch == b"l":
+        pos += 1
+        out = []
+        while data[pos:pos + 1] != b"e":
+            value, pos = bdecode(data, pos)
+            out.append(value)
+        return out, pos + 1
+    if ch == b"d":
+        pos += 1
+        out = {}
+        while data[pos:pos + 1] != b"e":
+            key, pos = bdecode(data, pos)
+            value, pos = bdecode(data, pos)
+            out[key] = value
+        return out, pos + 1
+    colon = data.index(b":", pos)
+    length = int(data[pos:colon])
+    start = colon + 1
+    return data[start:start + length], start + length
+
+
+def info_span(blob: bytes) -> Tuple[int, int]:
+    """定位顶层 info 字典在原始字节里的起止偏移（算 infohash 必须用原始切片）。"""
+    if not blob or blob[:1] != b"d":
+        raise ValueError("不是 bencode 字典")
+    pos = 1
+    while pos < len(blob) and blob[pos:pos + 1] != b"e":
+        key, pos = bdecode(blob, pos)
+        if key == b"info":
+            start = pos
+            _, pos = bdecode(blob, pos)
+            return start, pos
+        _, pos = bdecode(blob, pos)
+    raise ValueError("缺少 info 段")
+
+
+V2_BLOCK_SIZE = 16 * 1024
+_ZERO_LEAF = bytes(32)
+
+
+def piece_layer_height(piece_length: int) -> int:
+    """v2 piece 由若干 16KiB 块组成，返回该 piece 的 Merkle 高度。"""
+    if piece_length < V2_BLOCK_SIZE or piece_length % V2_BLOCK_SIZE:
+        raise ValueError("piece length 必须是 16KiB 的整数倍")
+    blocks = piece_length // V2_BLOCK_SIZE
+    if blocks & (blocks - 1):
+        raise ValueError("piece length 的块数必须是 2 的幂")
+    return blocks.bit_length() - 1
+
+
+def zero_hash(height: int) -> bytes:
+    value = _ZERO_LEAF
+    for _ in range(height):
+        value = hashlib.sha256(value + value).digest()
+    return value
+
+
+def merkle_root(hashes: Sequence[bytes], pad_hash: bytes = _ZERO_LEAF) -> bytes:
+    """把若干 32 字节 hash 归并成 Merkle 根，不足补 pad_hash 到 2 的幂。"""
+    if not hashes:
+        raise ValueError("Merkle 树至少需要一个 hash")
+    count = 1 << (len(hashes) - 1).bit_length()
+    level = list(hashes) + [pad_hash] * (count - len(hashes))
+    while len(level) > 1:
+        level = [
+            hashlib.sha256(level[i] + level[i + 1]).digest()
+            for i in range(0, len(level), 2)
+        ]
+    return level[0]
+
+
 def infohash_of(blob: bytes) -> str:
-    """从 .torrent 内容算 infohash。优先 torrentool（宿主自带），bencodepy 兜底。"""
+    """算 v1 infohash：对原始 info 段字节做 sha1。
+
+    必须用原始切片，不能用「解析后再编码」——重新编码会改变键顺序，
+    算出来的 hash 就不是真值了（下载器按 infohash 认种子，错一个字节都不认）。
+    """
+    try:
+        start, end = info_span(blob)
+        return hashlib.sha1(blob[start:end]).hexdigest()
+    except Exception:
+        pass
+    # 兜底：老路径
     try:
         from torrentool.api import Torrent
         return str(Torrent.from_string(blob).info_hash or "")
@@ -292,82 +386,118 @@ def infohash_of(blob: bytes) -> str:
 
 
 def parse_torrent(blob: bytes) -> Optional[Dict[str, Any]]:
-    """解析 .torrent，返回统一结构。优先 torrentool，bencodepy 兜底。
+    """解析 .torrent，支持 v1 / v2 / hybrid。返回统一结构。
 
     返回 {
-      name, piece_length, pieces(bytes), files:[{path:[str], length:int}],
-      total, infohash
+      name, piece_length, pieces(bytes, 仅 v1/hybrid),
+      files:[{path:[str], length:int, padding:bool, zero_length:bool}],
+      multi, total, infohash, kind(v1/v2/hybrid), v2_roots: [[bytes...]]
     }
+    v2 时 pieces 为空，改为按文件在 v2_roots 里保存每个文件的 piece-layer 哈希；
+    padding 标记用于校验时喂零字节，zero_length 表示该文件长度为 0。
     """
-    info: Optional[dict] = None
-    name = ""
-    # 优先 torrentool（MP 容器内自带，能正确读 byte_keys={'pieces'}）
     try:
-        from torrentool.api import Torrent
-        t = Torrent.from_string(blob)
-        raw = t._struct.get("info", {})
-        info = raw
-        name = getattr(t, "name", "") or ""
+        meta, _ = bdecode(blob)
     except Exception:
-        info = None
-    # 兜底 bencodepy
-    if info is None:
-        try:
-            import bencodepy
-            meta = bencodepy.decode(blob)
-            info_raw = meta[b"info"]
-            info = {
-                "name": info_raw.get(b"name", b""),
-                "piece length": info_raw.get(b"piece length", 0),
-                "pieces": info_raw.get(b"pieces", b""),
-                "files": info_raw.get(b"files"),
-                "length": info_raw.get(b"length", 0),
-            }
-            nb = info.get("name")
-            name = nb.decode("utf-8", "replace") if isinstance(nb, bytes) else str(nb or "")
-        except Exception:
-            return None
+        return None
+    if not isinstance(meta, dict) or b"info" not in meta:
+        return None
+    info = meta[b"info"]
+    if not isinstance(info, dict):
+        return None
 
     def dec(x: Any) -> str:
         return x.decode("utf-8", "replace") if isinstance(x, bytes) else str(x or "")
 
-    plRaw = info.get("piece length") or info.get(b"piece length") or 0
-    piece_length = int(plRaw)
-    pieces = info.get("pieces") or info.get(b"pieces") or b""
+    name = dec(info.get(b"name") or b"")
+    piece_length = int(info.get(b"piece length") or 0)
+    pieces = info.get(b"pieces") or b""
     if isinstance(pieces, str):
         pieces = pieces.encode("latin-1")
+    meta_version = info.get(b"meta version")
+    has_v2 = (meta_version == 2) or (b"file tree" in info)
+    has_v1 = bool(pieces)
 
     files: List[Dict[str, Any]] = []
-    filesRaw = info.get("files") or info.get(b"files")
-    # multi=True 表示「目录模式」：即便只有一个文件，下载器也会在 download_dir
-    # 下先建 info.name 目录，文件再落进去。只有真正没有 files 字段的种子才是
-    # 单文件（info.name 就是文件名本身）。
-    multi = bool(filesRaw)
-    if filesRaw:
-        for f in filesRaw:
-            if isinstance(f, dict):
-                path_raw = f.get(b"path") or f.get("path") or []
-                length_raw = f.get(b"length") or f.get("length") or 0
-            else:
-                continue
-            path = [dec(x) for x in (path_raw or [])]
-            length = int(length_raw)
-            files.append({"path": path, "length": length})
-    else:
-        length_raw = info.get("length") or info.get(b"length") or 0
-        nb = info.get("name") or info.get(b"name") or ""
-        files = [{"path": [dec(nb)], "length": int(length_raw)}]
+    v2_roots: List[List[bytes]] = []
+    if has_v2 and b"file tree" in info:
+        # v2：walk file tree，叶节点是 {length, pieces root?, attr?}
+        def walk(node: Any, prefix: List[str]) -> None:
+            if not isinstance(node, dict):
+                return
+            for key, child in node.items():
+                if not isinstance(child, dict):
+                    continue
+                seg = dec(key) if isinstance(key, bytes) else str(key)
+                if b"" in child:
+                    leaf = child[b""]
+                    if isinstance(leaf, dict):
+                        length = int(leaf.get(b"length") or 0)
+                        attr = leaf.get(b"attr") or b""
+                        padding = isinstance(attr, bytes) and b"p" in attr
+                        files.append({
+                            "path": prefix + [seg],
+                            "length": length,
+                            "padding": padding,
+                            "zero_length": length == 0,
+                        })
+                        layer = leaf.get(b"pieces root")
+                        if isinstance(layer, bytes) and len(layer) == 32:
+                            v2_roots.append([layer])
+                        else:
+                            v2_roots.append([])
+                    continue
+                walk(child, prefix + [seg])
 
-    total = sum(f["length"] for f in files)
+        walk(info[b"file tree"], [])
+        # 顶层 pieces root 若存在，是整棵树的根（单文件或多文件共享）；
+        # 这里按文件粒度保存，逐文件比对 piece-layer。
+        kind = "hybrid" if has_v1 else "v2"
+        if kind == "hybrid":
+            # hybrid 同时带 v1 的 files/单文件布局，优先用 v1 结构做校验
+            files = _parse_v1_files(info, dec)
+    else:
+        files = _parse_v1_files(info, dec)
+        kind = "v1"
+
+    total = sum(int(f["length"]) for f in files)
     return {
-        "name": dec(name) if isinstance(name, bytes) else name,
+        "name": name,
         "piece_length": piece_length,
-        "pieces": pieces,
+        "pieces": pieces if kind != "v2" else b"",
         "files": files,
-        "multi": multi,
+        "multi": bool(info.get(b"files")),
         "total": total,
         "infohash": infohash_of(blob),
+        "kind": kind,
+        "v2_roots": v2_roots,
     }
+
+
+def _parse_v1_files(info: dict, dec: Callable[[Any], str]) -> List[Dict[str, Any]]:
+    """按 v1 结构解析文件列表（单文件/多文件），带 padding/zero-length 标记。"""
+    files: List[Dict[str, Any]] = []
+    files_raw = info.get(b"files")
+    if files_raw:
+        for f in files_raw:
+            if not isinstance(f, dict):
+                continue
+            path = [dec(x) for x in (f.get(b"path") or [])]
+            length = int(f.get(b"length") or 0)
+            attr = f.get(b"attr") or b""
+            padding = isinstance(attr, bytes) and b"p" in attr
+            files.append({
+                "path": path,
+                "length": length,
+                "padding": padding,
+                "zero_length": length == 0,
+            })
+    else:
+        length = int(info.get(b"length") or 0)
+        name = dec(info.get(b"name") or b"")
+        files = [{"path": [name], "length": length, "padding": False,
+                  "zero_length": length == 0}]
+    return files
 
 
 # ---------------------------------------------------------------- 发现
@@ -637,91 +767,492 @@ def verify_local_file_in_torrent(
     prefer_season: int = 0,
     prefer_episode: int = 0,
 ) -> Tuple[int, int, str]:
-    """校验本地单集文件的内容是否与候选种子描述的 piece 一致。
+    """校验本地单集文件的内容是否与候选种子一致（兼容包装，返回 (matched, checked, reason)）。
 
-    与 verify_pieces 的区别：不依赖「种子内文件名 == 本地文件名」，而是
-    用候选种子的文件清单，按体积定位本地单集对应的是种子里的哪一个文件，
-    再计算该文件在种子连续字节流中的 piece 偏移，只校验完全落在该文件
-    内部的 piece（跨文件边界的 piece 因缺少种子里的其它文件而跳过）。
-
-    这是拆包辅种的正确校验口径：内容一致即可，不要求整包其它文件都在本地。
-
-    返回 (matched, checked, reason)。
+    实际走 span 流校验内核：把候选种子的全部文件拼成逻辑字节流，
+    本地能提供的文件映射为可读 span，缺失文件占位标 unavailable，
+    这样一个「跨越本地文件与缺失文件」的 piece 会被判为未知，
+    而「跨越两个都在本地的文件」的 piece 则能被正确校验（旧版直接跳过）。
     """
+    local_map = _map_local_targets(meta, local_file, prefer_season, prefer_episode)
+    verdict = verify_torrent_content(meta, local_map, pieces_to_check=pieces_to_check)
+    if verdict.verified == 0 and verdict.mismatch == 0:
+        return 0, 0, verdict.reason
+    checked = verdict.verified + verdict.mismatch
+    if verdict.mismatch:
+        return verdict.verified, verdict.verified + 1, verdict.reason
+    return verdict.verified, checked, verdict.reason if verdict.level != "full" else "OK"
+
+
+# ---------------------------------------------------------------- 内容校验内核
+# 把 torrent 的文件列表建成一条逻辑字节流（span 序列），
+# 按 piece 边界顺序消费。padding 喂零字节、缺失文件标 unavailable 但不破坏偏移，
+# 因此跨文件 piece（含跨 padding）都能被正确判定。读取前后各拍一次文件快照
+# （dev/inode/size/mtime），中途被改写即判失败，避免「校验时通过、做种时错位」。
+
+
+@dataclass
+class _FileSnapshot:
+    device: int
+    inode: int
+    size: int
+    mtime_ns: int
+
+
+@dataclass
+class FileSpan:
+    """种子内一个文件在逻辑字节流中的一段。"""
+    torrent_path: str
+    length: int
+    local_path: Optional[str] = None
+    padding: bool = False
+    zero_length: bool = False
+    snapshot: Optional[_FileSnapshot] = None
+
+
+@dataclass
+class ContentVerdict:
+    """内容校验结论：带证据等级，区分「不符」「缺失」「通过」。"""
+    level: str = "blocked"      # full / sampled / client_check / blocked
+    verified: int = 0           # 校验通过的 piece 数
+    mismatch: int = 0           # 内容不符的 piece 数
+    unavailable: int = 0        # 因缺文件无法判定的 piece 数
+    checked: int = 0            # 实际比对过的 piece 数（verified+mismatch）
+    reason: str = ""
+    covered_files: List[str] = field(default_factory=list)   # 本地能覆盖的种子文件
+    missing_files: List[str] = field(default_factory=list)   # 本地缺的种子文件
+
+
+def _snapshot_file(path: str) -> _FileSnapshot:
+    st = os.stat(path, follow_symlinks=False)
+    return _FileSnapshot(st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns)
+
+
+def _snapshot_same(a: Optional[_FileSnapshot], b: Optional[_FileSnapshot]) -> bool:
+    if a is None or b is None:
+        return a is b
+    return (a.device, a.inode, a.size) == (b.device, b.inode, b.size)
+
+
+def _hash_file_range(hasher: Any, fd: int, offset: int, length: int,
+                     chunk: int = 4 * 1024 * 1024) -> None:
+    """把文件 [offset, offset+length) 的字节喂给 hasher（不返回 digest）。"""
+    os.lseek(fd, offset, os.SEEK_SET)
+    remaining = length
+    while remaining > 0:
+        data = os.read(fd, min(remaining, chunk))
+        if not data:
+            raise OSError("读取期间文件提前结束")
+        hasher.update(data)
+        remaining -= len(data)
+
+
+def _hash_zeros(hasher: Any, length: int, chunk: int = 4 * 1024 * 1024) -> None:
+    """把 length 个零字节喂给 hasher。"""
+    zero = bytes(min(length, chunk))
+    remaining = length
+    while remaining > 0:
+        take = min(remaining, len(zero))
+        hasher.update(zero[:take])
+        remaining -= take
+
+
+def _map_local_targets(
+    meta: Dict[str, Any],
+    local_file: str,
+    prefer_season: int = 0,
+    prefer_episode: int = 0,
+) -> Dict[str, str]:
+    """把种子里的文件映射到本地可用文件：先按季集号，再按等大体积。
+
+    只映射「本地确实存在且体积与种子声明一致」的文件；体积不同说明是不同版本，
+    不做映射（校验时该 span 记为不可用，不会误判成内容不符）。
+    """
+    files = meta.get("files") or []
+    out: Dict[str, str] = {}
+    if not files or not local_file or not os.path.exists(local_file):
+        return out
+    try:
+        local_size = os.path.getsize(local_file)
+    except OSError:
+        return out
+    target_idx = -1
+    if prefer_episode:
+        for i, f in enumerate(files):
+            rel = "/".join(f["path"]) if f.get("path") else str(meta.get("name") or "")
+            if same_episode(rel, prefer_season, prefer_episode):
+                target_idx = i
+                break
+    if target_idx < 0:
+        for i, f in enumerate(files):
+            if int(f.get("length") or 0) == local_size:
+                target_idx = i
+                break
+    if target_idx < 0:
+        return out
+    if int(files[target_idx].get("length") or 0) != local_size:
+        # 集号命中了但体积不同：不同版本，不能映射
+        return out
+    rel_key = "/".join(files[target_idx]["path"]) if files[target_idx].get("path") else str(meta.get("name") or "")
+    out[rel_key] = local_file
+    return out
+
+
+def _build_spans(meta: Dict[str, Any], local_map: Dict[str, str]) -> List[FileSpan]:
+    """按种子文件顺序建 span 序列，缺失文件也占位（保证偏移不错位）。"""
+    spans: List[FileSpan] = []
+    for f in meta.get("files") or []:
+        rel = "/".join(f["path"]) if f.get("path") else str(meta.get("name") or "")
+        length = int(f.get("length") or 0)
+        if f.get("padding"):
+            spans.append(FileSpan(rel, length, None, padding=True))
+            continue
+        if length == 0 or f.get("zero_length"):
+            spans.append(FileSpan(rel, 0, None, zero_length=True))
+            continue
+        local = local_map.get(rel)
+        snap = None
+        if local and os.path.exists(local):
+            try:
+                snap = _snapshot_file(local)
+                if snap.size != length:
+                    # 体积不符视为不可用，避免把不同版本算成 mismatch
+                    local, snap = None, None
+            except OSError:
+                local, snap = None, None
+        spans.append(FileSpan(rel, length, local, snapshot=snap))
+    return spans
+
+
+def verify_torrent_content(
+    meta: Dict[str, Any],
+    local_map: Dict[str, str],
+    pieces_to_check: Optional[int] = None,
+    log: Callable[[str], None] = lambda m: None,
+) -> ContentVerdict:
+    """按 span 流校验候选种子与本地文件的逐片一致性。
+
+    local_map: {种子内相对路径: 本地绝对路径}，只放确实存在的文件。
+    返回带证据等级的 ContentVerdict。
+    """
+    kind = str(meta.get("kind") or "v1")
+    if kind == "v2":
+        return _verify_v2(meta, local_map)
+    return _verify_v1_stream(meta, local_map, pieces_to_check, log)
+
+
+def _verify_v1_stream(
+    meta: Dict[str, Any],
+    local_map: Dict[str, str],
+    pieces_to_check: Optional[int],
+    log: Callable[[str], None],
+) -> ContentVerdict:
     pieces = meta.get("pieces") or b""
     plen = int(meta.get("piece_length") or 0)
     files = meta.get("files") or []
     if not pieces or not plen or not files:
-        return 0, 0, "种子缺少 pieces / 文件清单"
-    local_size = os.path.getsize(local_file)
-    if local_size <= 0:
-        return 0, 0, "本地文件为空"
-
-    # 定位本地单集在种子文件序列中的位置：
-    #   ① 先按季集号定位（同集即可，体积不必相等）——整包与本地压制版本不同时
-    #      体积必然不同，但仍是「同一个文件」，是否真一致交给 piece 判断；
-    #   ② 集号定位不到，再退回等大体积匹配（无集号的整包或单文件种子）。
-    match_index = -1
-    if prefer_episode:
-        for i, f in enumerate(files):
-            rel = "/".join(f["path"]) if f["path"] else str(meta.get("name") or "")
-            if same_episode(rel, prefer_season, prefer_episode):
-                match_index = i
-                break
-        if match_index >= 0:
-            seed_len = int(files[match_index]["length"])
-            if seed_len != local_size:
-                return 0, 0, (
-                    f"集号命中但体积不同（本地 {local_size // 1048576}MB / "
-                    f"种子 {seed_len // 1048576}MB），非同一版本"
-                )
-    if match_index < 0:
-        for i, f in enumerate(files):
-            if int(f["length"]) == local_size:
-                match_index = i
-                break
-    if match_index < 0:
-        return 0, 0, "种子内未找到对应集的文件"
-
-    # 该文件在种子字节流里的起始偏移
-    start = sum(int(f["length"]) for f in files[:match_index])
-    file_len = local_size
+        return ContentVerdict(level="blocked", reason="种子缺少 pieces / 文件清单")
     total_pieces = len(pieces) // 20
-    first_piece = start // plen
-    # 最后一个 piece 的结束偏移
-    last_piece_end = start + file_len
-    last_piece = (last_piece_end - 1) // plen
+    if total_pieces <= 0:
+        return ContentVerdict(level="blocked", reason="pieces 为空")
 
-    # 只校验完全落在该文件内部的 piece：
-    #   piece 起点 >= start 且 piece 终点 <= start + file_len
-    checkable: List[int] = []
-    for pno in range(first_piece, min(last_piece, total_pieces - 1) + 1):
+    spans = _build_spans(meta, local_map)
+    total_length = sum(s.length for s in spans)
+    if total_length <= 0:
+        return ContentVerdict(level="blocked", reason="文件总长度为 0")
+    # 每个 span 在逻辑流中的起始偏移
+    offsets: List[int] = []
+    acc = 0
+    for s in spans:
+        offsets.append(acc)
+        acc += s.length
+
+    covered = [s.torrent_path for s in spans if s.local_path]
+    missing = [s.torrent_path for s in spans
+               if not s.local_path and not s.padding and not s.zero_length]
+    if not covered:
+        return ContentVerdict(
+            level="blocked", reason="本地没有能对应上的文件",
+            missing_files=missing,
+        )
+
+    # 把与本地 span 有交集的 piece 分成「全覆盖(可验)」与「跨到缺失文件(未知)」两类。
+    # 抽样只在可验集合里取，否则首末片常因邻居缺失而白占名额。
+    verifiable: List[int] = []
+    span_for_piece: Dict[int, bool] = {}
+    for idx, span in enumerate(spans):
+        if not span.local_path:
+            continue
+        s_start = offsets[idx]
+        s_end = s_start + span.length
+        first = s_start // plen
+        last = min((s_end - 1) // plen, total_pieces - 1)
+        for pno in range(first, last + 1):
+            span_for_piece[pno] = True
+    # 判断每个候选 piece 是否全部字节来自本地可读 span 或 padding
+    def piece_fully_local(pno: int) -> bool:
         p_start = pno * plen
-        p_end = p_start + plen
-        if p_start >= start and p_end <= start + file_len:
-            checkable.append(pno)
-            if pieces_to_check and len(checkable) >= pieces_to_check:
+        p_end = min(p_start + plen, total_length)
+        pos = p_start
+        sidx = 0
+        for i, off in enumerate(offsets):
+            if off + spans[i].length > p_start:
+                sidx = i
                 break
-    if not checkable:
-        return 0, 0, "单集太小，无完整可校验 piece"
+        while pos < p_end and sidx < len(spans):
+            span = spans[sidx]
+            s_off = offsets[sidx]
+            in_span = pos - s_off
+            take = min(p_end - pos, span.length - in_span)
+            if take <= 0:
+                sidx += 1
+                continue
+            if not span.padding and span.local_path is None:
+                return False
+            pos += take
+            sidx += 1
+        return pos >= p_end
 
-    matched = 0
-    with open(local_file, "rb") as fh:
-        for pno in checkable:
-            offset_in_file = pno * plen - start
-            fh.seek(offset_in_file)
-            data = fh.read(plen)
-            if len(data) < plen:
-                break
+    for pno in sorted(span_for_piece):
+        if piece_fully_local(pno):
+            verifiable.append(pno)
+    if not verifiable:
+        return ContentVerdict(
+            level="client_check",
+            reason="本地文件对应的 piece 都跨越了缺失文件，无法独立判定",
+            missing_files=missing, covered_files=covered,
+        )
+
+    # 抽样：取可验集合的首片、末片与均匀间隔
+    if pieces_to_check and 0 < pieces_to_check < len(verifiable):
+        n = len(verifiable)
+        if pieces_to_check == 1:
+            chosen = [verifiable[0]]
+        else:
+            step = (n - 1) / (pieces_to_check - 1)
+            chosen = sorted({verifiable[round(i * step)] for i in range(pieces_to_check)})
+    else:
+        chosen = verifiable
+
+    verified = mismatch = unavailable = 0
+    first_bad = ""
+    bad_piece = -1
+    # 快照：只对真正会被读到的文件拍
+    read_spans = {s.local_path for s in spans if s.local_path}
+    pre_snap = {}
+    for p in read_spans:
+        try:
+            pre_snap[p] = _snapshot_file(p)
+        except OSError:
+            pre_snap[p] = None
+
+    open_fds: Dict[str, int] = {}
+    try:
+        for pno in chosen:
+            p_start = pno * plen
+            p_end = min(p_start + plen, total_length)
+            need = p_end - p_start
+            hasher = hashlib.sha1()
+            span_idx = 0
+            # 定位首个可能与 piece 相交的 span（线性扫描偏移表，span 数通常很小）
+            for i, off in enumerate(offsets):
+                if off + spans[i].length > p_start:
+                    span_idx = i
+                    break
+            pos = p_start
+            ok = True
+            avail = True
+            while pos < p_end and span_idx < len(spans):
+                span = spans[span_idx]
+                s_off = offsets[span_idx]
+                in_span = pos - s_off
+                take = min(p_end - pos, span.length - in_span)
+                if take <= 0:
+                    span_idx += 1
+                    continue
+                if span.padding:
+                    _hash_zeros(hasher, take)
+                elif span.local_path is None:
+                    avail = False
+                    break
+                else:
+                    fd = open_fds.get(span.local_path)
+                    try:
+                        if fd is None:
+                            fd = os.open(span.local_path, os.O_RDONLY)
+                            open_fds[span.local_path] = fd
+                        _hash_file_range(hasher, fd, in_span, take)
+                    except OSError:
+                        avail = False
+                        break
+                pos += take
+                span_idx += 1
+            if not avail or pos < p_end:
+                unavailable += 1
+                continue
             expect = pieces[pno * 20:(pno + 1) * 20]
-            if hashlib.sha1(data).digest() == expect:
-                matched += 1
+            if hasher.digest() == expect:
+                verified += 1
             else:
-                return matched, matched + 1, f"片号 {pno} 校验失败"
-    checked = matched
-    if matched != len(checkable):
-        return matched, checked, "读取中断"
-    return matched, checked, "OK"
+                mismatch += 1
+                if not first_bad:
+                    first_bad = f"片号 {pno} 内容不符"
+                    bad_piece = pno
+    finally:
+        for fd in open_fds.values():
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+    # 读完复核快照，防止校验期间源文件被改写
+    for p, snap in pre_snap.items():
+        try:
+            now = _snapshot_file(p)
+        except OSError:
+            now = None
+        if not _snapshot_same(snap, now):
+            return ContentVerdict(
+                level="blocked", reason="校验期间源文件发生变化，结果不可信",
+                verified=verified, mismatch=mismatch, unavailable=unavailable,
+                covered_files=covered, missing_files=missing,
+            )
+
+    checked = verified + mismatch
+    if mismatch:
+        return ContentVerdict(
+            level="blocked", reason=first_bad or "内容不符",
+            verified=verified, mismatch=mismatch, unavailable=unavailable,
+            checked=checked, covered_files=covered, missing_files=missing,
+        )
+    if verified == 0:
+        return ContentVerdict(
+            level="client_check",
+            reason="本地与候选的交集 piece 全部无法判定（相邻文件缺失）",
+            verified=0, mismatch=0, unavailable=unavailable, checked=0,
+            covered_files=covered, missing_files=missing,
+        )
+    # 抽样 vs 全量：只有「本地能覆盖的所有 piece 都验过」才算 full
+    sampled = bool(pieces_to_check and pieces_to_check > 0
+                   and pieces_to_check < len(verifiable))
+    if unavailable and not sampled:
+        # 有产物片段无法判定（相邻文件不在本地），但已验部分全部一致
+        return ContentVerdict(
+            level="client_check",
+            reason=f"通过 {verified} 片，另有 {unavailable} 片因相邻文件缺失无法判定",
+            verified=verified, mismatch=0, unavailable=unavailable, checked=checked,
+            covered_files=covered, missing_files=missing,
+        )
+    level = "sampled" if sampled else "full"
+    return ContentVerdict(
+        level=level, reason="OK",
+        verified=verified, mismatch=0, unavailable=unavailable, checked=checked,
+        covered_files=covered, missing_files=missing,
+    )
+
+
+def _verify_v2(
+    meta: Dict[str, Any],
+    local_map: Dict[str, str],
+) -> ContentVerdict:
+    """v2：按文件粒度算 piece-layer 的 Merkle 根并与种子声明比对。
+
+    v2 的校验单位是「文件」，没有跨文件 piece，比 v1 简单。
+    只校验本地有映射的文件；缺失文件记为 missing，不影响已映射文件的判定。
+    """
+    plen = int(meta.get("piece_length") or 0)
+    files = meta.get("files") or []
+    roots = meta.get("v2_roots") or []
+    if not plen or not files:
+        return ContentVerdict(level="blocked", reason="v2 种子缺少 piece length / 文件清单")
+    try:
+        height = piece_layer_height(plen)
+    except ValueError:
+        return ContentVerdict(level="blocked", reason="v2 piece length 非法")
+
+    covered, missing = [], []
+    verified = mismatch = 0
+    first_bad = ""
+    for i, f in enumerate(files):
+        rel = "/".join(f["path"]) if f.get("path") else str(meta.get("name") or "")
+        if f.get("padding") or int(f.get("length") or 0) == 0:
+            continue
+        local = local_map.get(rel)
+        if not local or not os.path.exists(local):
+            missing.append(rel)
+            continue
+        covered.append(rel)
+        if i >= len(roots) or not roots[i]:
+            missing.append(rel)
+            continue
+        expect = roots[i][0]
+        try:
+            actual = _v2_file_root(local, plen, height)
+        except OSError:
+            missing.append(rel)
+            continue
+        if actual == expect:
+            verified += 1
+        else:
+            mismatch += 1
+            if not first_bad:
+                first_bad = f"{os.path.basename(rel)} 内容不符"
+
+    if mismatch:
+        return ContentVerdict(level="blocked", reason=first_bad,
+                              verified=verified, mismatch=mismatch,
+                              checked=verified + mismatch,
+                              covered_files=covered, missing_files=missing)
+    if verified == 0:
+        return ContentVerdict(level="blocked", reason="没有可校验的 v2 文件",
+                              covered_files=covered, missing_files=missing)
+    return ContentVerdict(level="full", reason="OK",
+                          verified=verified, mismatch=0, checked=verified,
+                          covered_files=covered, missing_files=missing)
+
+
+def _v2_file_root(path: str, piece_length: int, height: int) -> bytes:
+    """计算单个文件在 v2 下的 piece-layer Merkle 根。"""
+    st = _snapshot_file(path)
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        piece_hashes: List[bytes] = []
+        offset = 0
+        while offset < st.size:
+            take = min(piece_length, st.size - offset)
+            piece_hashes.append(_merkle_of_blocks(fd, offset, take, height))
+            offset += take
+        if not piece_hashes:
+            return _ZERO_LEAF
+        if len(piece_hashes) == 1:
+            return piece_hashes[0]
+        return merkle_root(piece_hashes, pad_hash=zero_hash(height))
+    finally:
+        os.close(fd)
+
+
+def _merkle_of_blocks(fd: int, offset: int, length: int, height: int) -> bytes:
+    """把一个 piece 内的数据按 16KiB 切块做 Merkle，得到该 piece 的 hash。"""
+    block_hashes: List[bytes] = []
+    os.lseek(fd, offset, os.SEEK_SET)
+    remaining = length
+    while remaining > 0:
+        take = min(V2_BLOCK_SIZE, remaining)
+        data = os.read(fd, take)
+        if not data:
+            raise OSError("读取期间文件提前结束")
+        block_hashes.append(hashlib.sha256(data).digest())
+        remaining -= len(data)
+    if not block_hashes:
+        return _ZERO_LEAF
+    if len(block_hashes) == 1 and height == 0:
+        return block_hashes[0]
+    total = 1 << height
+    level = list(block_hashes) + [_ZERO_LEAF] * (total - len(block_hashes))
+    while len(level) > 1:
+        level = [hashlib.sha256(level[i] + level[i + 1]).digest()
+                 for i in range(0, len(level), 2)]
+    return level[0]
 
 
 def episodes_of_meta(meta: Dict[str, Any]) -> Set[int]:

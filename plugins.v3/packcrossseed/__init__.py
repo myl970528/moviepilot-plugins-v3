@@ -41,6 +41,7 @@ from .engine import (
     proper_subset,
     screen_candidates,
     verify_local_file_in_torrent,
+    verify_torrent_content,
 )
 from . import config_form
 
@@ -57,7 +58,7 @@ class PackCrossSeed(_PluginBase):
     plugin_name = "拆包辅种"
     plugin_desc = "整包按电影/单集拆分，跨站匹配独立种子并做 piece 校验，硬链接生成副本后辅种。原包不动。"
     plugin_icon = "package.png"
-    plugin_version = "1.2.3"
+    plugin_version = "1.2.4"
     plugin_author = "sdcsmyl"
     author_url = ""
     plugin_config_prefix = "packcrossseed_"
@@ -951,18 +952,63 @@ class PackCrossSeed(_PluginBase):
                 return False, cand.verify_reason
         # 不再用「种子里必须有等大文件」当门槛：压制版本不同时体积必然不同，
         # 但仍是同一个片子，能否复用由 piece 校验按集号定位后判定。
-        # 用本地单集文件的字节，按候选种子的 piece 边界做内容校验
-        matched, checked, reason = verify_local_file_in_torrent(
-            meta,
-            unit.source_path,
-            pieces_to_check=self._pieces_to_check or None,
-            prefer_season=unit.season,
-            prefer_episode=unit.episode,
+        # 构建完整 local_map：目标集 + 同目录里能按季集号+体积对上的其它集，
+        # 这样两集合集候选的「跨集边界 piece」也能被正确校验，而不是一律判未知。
+        local_map = self.__build_local_map(meta, unit)
+        verdict = verify_torrent_content(
+            meta, local_map, pieces_to_check=self._pieces_to_check or None,
         )
-        cand.piece_total, cand.piece_matched = checked, matched
-        cand.verify_ok = (checked > 0 and matched == checked and reason == "OK")
-        cand.verify_reason = reason if not cand.verify_ok else f"通过 {matched}/{checked} 片"
+        cand.piece_total = verdict.checked
+        cand.piece_matched = verdict.verified
+        # 通过口径：没有任何内容不符（mismatch=0）且至少有 1 片验过。
+        # 若存在跨到缺失文件的片（client_check），仍允许加种——拆包场景本就
+        # 只保证本地这一集可用，其余集由下载器按种子补齐或跳过。
+        cand.verify_ok = (verdict.mismatch == 0 and verdict.verified > 0)
+        if cand.verify_ok:
+            cand.verify_reason = f"通过 {verdict.verified} 片（{verdict.level}）"
+        else:
+            cand.verify_reason = verdict.reason or "校验未通过"
         return cand.verify_ok, cand.verify_reason
+
+    def __build_local_map(self, meta: dict, unit: Unit) -> Dict[str, str]:
+        """把候选种子里的文件映射到本地实际文件，供 span 校验使用。
+
+        目标集用 unit.source_path 直接钉死；其余集在源目录里按 (季,集)+体积
+        找同名/同集文件（走 __local_episode_index，跨发布组也能对上）。
+        只映射「本地存在且体积与种子声明一致」的文件，避免把不同版本
+        错算成内容不符。
+        """
+        out: Dict[str, str] = {}
+        files = meta.get("files") or []
+        base = os.path.dirname(unit.source_path)
+        target_size = os.path.getsize(unit.source_path) if os.path.exists(unit.source_path) else 0
+        index = None
+        for f in files:
+            rel = os.path.join(*f["path"]) if f.get("path") else str(meta.get("name") or "")
+            rel_key = "/".join(f["path"]) if f.get("path") else str(meta.get("name") or "")
+            length = int(f.get("length") or 0)
+            if f.get("padding") or length == 0:
+                continue
+            # ① 目标集：体积吻合直接钉
+            if target_size and length == target_size and rel_key not in out:
+                out[rel_key] = unit.source_path
+                continue
+            # ② 其余集：按季集号 + 体积在源目录找
+            _s, _e, is_ep = episode_info(os.path.basename(rel))
+            if not is_ep or not _e:
+                continue
+            if index is None:
+                index = self.__local_episode_index(base)
+            for (season, ep), items in index.items():
+                if ep != _e:
+                    continue
+                for path, size in items:
+                    if size == length and rel_key not in out:
+                        out[rel_key] = path
+                        break
+                if rel_key in out:
+                    break
+        return out
 
     @staticmethod
     def __split_recipe(raw: str) -> Tuple[str, Optional[dict]]:
