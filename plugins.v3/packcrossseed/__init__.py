@@ -60,7 +60,7 @@ class PackCrossSeed(_PluginBase):
     plugin_name = "拆包辅种"
     plugin_desc = "整包按电影/单集拆分，跨站匹配独立种子并做 piece 校验，硬链接生成副本后辅种。原包不动。"
     plugin_icon = "package.png"
-    plugin_version = "1.2.6"
+    plugin_version = "1.2.7"
     plugin_author = "sdcsmyl"
     author_url = ""
     plugin_config_prefix = "packcrossseed_"
@@ -112,6 +112,11 @@ class PackCrossSeed(_PluginBase):
     _search_cache: Dict[str, List[dict]] = {}
     _ep_index: Dict[str, Dict[Any, List[Tuple[str, int]]]] = {}
     _all_instances: List[Any] = []
+    # 实例 id -> 下载器名，用于判重日志说明「命中在哪台下载器」
+    _inst_names: Dict[int, str] = {}
+    # 最近一次判重命中的下载器名与 hash（仅用于日志说明）
+    _dup_hit: str = ""
+    _dup_hash: str = ""
     # 本轮候选种子 blob 缓存（run_once 里从持久化加载，结束时写回）
     _blob_cache: Dict[str, dict] = {}
     _stop_flag: bool = False
@@ -572,11 +577,13 @@ class PackCrossSeed(_PluginBase):
             self._search_cache = {}
             self._ep_index = {}
             self._all_instances = []
+            self._inst_names = {}
             try:
-                for _info in (DownloaderHelper().get_services() or {}).values():
+                for _name, _info in (DownloaderHelper().get_services() or {}).items():
                     _inst = getattr(_info, "instance", None)
                     if _inst and not getattr(_inst, "is_inactive", lambda: False)():
                         self._all_instances.append(_inst)
+                        self._inst_names[id(_inst)] = str(_name)
             except Exception:  # noqa: BLE001
                 pass
         started = time.time()
@@ -686,7 +693,12 @@ class PackCrossSeed(_PluginBase):
                     if self.__is_duplicate(target, meta):
                         stats["dup"] += 1
                         self.__unit_cache_put(unit_cache, unit, "dup")
-                        self._log(f"  目标下载器已有该种子，跳过: {unit.name[:40]}")
+                        # 日志要说清楚「重复的是什么」：单元名 + 候选种子名/站点 + 命中哪台下载器
+                        self._log(
+                            f"  已有该种子，跳过 单元[{unit.name[:34]}] "
+                            f"候选[{str(best.title or '')[:34]}]@{best.site} "
+                            f"命中={self._dup_hit or '未知'} hash={str(meta.get('infohash') or '')[:12]}"
+                        )
                         continue
 
                     if self._dry_run:
@@ -1636,6 +1648,9 @@ class PackCrossSeed(_PluginBase):
                 existing = instance.get_torrents(ids=[hash_str])
                 items = existing[0] if isinstance(existing, tuple) else existing
                 if items:
+                    # 记录命中在哪台下载器，供上层日志说明来源
+                    self._dup_hit = self._inst_names.get(id(instance), "") or "未知下载器"
+                    self._dup_hash = hash_str
                     return True
             except Exception:  # noqa: BLE001
                 continue
