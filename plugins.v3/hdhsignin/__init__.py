@@ -53,7 +53,7 @@ class HdhSignIn(_PluginBase):
     # 插件图标
     plugin_icon = "signin.png"
     # 插件版本
-    plugin_version = "1.2"
+    plugin_version = "1.3"
     # 插件作者
     plugin_author = "sdcsmyl"
     # 作者主页
@@ -198,8 +198,10 @@ class HdhSignIn(_PluginBase):
                 break
 
             msg = str(result.get("msg") or "")
-            # 账号密码错、被风控这类重试也没用，直接停
-            if any(k in msg for k in ("账号或密码", "人机验证", "未配置", "登录失败")):
+            # 账号密码错、被风控这类重试也没用，直接停；Browserless 额度耗尽
+            # 是确定性失败，重试只会再撞三次 401，也直接停。
+            if any(k in msg for k in ("账号或密码", "人机验证", "未配置", "登录失败",
+                                      "units usage limit", "Browserless 返回 401")):
                 break
             if attempt < max_retry:
                 logger.warning(f"栖影签到第 {attempt + 1} 次失败：{msg}，60 秒后重试")
@@ -244,7 +246,7 @@ class HdhSignIn(_PluginBase):
         ci_raw = str((data.get("k2") or {}).get("value") or "")
 
         me_status, me = _split_response(me_raw)
-        if me_status != 200:
+        if not 200 <= me_status < 300:
             hint = "登录失败"
             if me_status == 401:
                 hint = "登录失败（账号或密码错误，或站点新增了校验）"
@@ -273,7 +275,10 @@ class HdhSignIn(_PluginBase):
                 "level": level, "nickname": nickname,
             }
 
-        if ci_status == 200:
+        # 站点签到成功返回 201 Created（不是 200）。早期只认 200，导致每天
+        # 签到其实已成功却被判失败、60 秒后重跑一次完整浏览器会话，Browserless
+        # 免费额度因此翻倍消耗。这里按 2xx 全算成功。
+        if 200 <= ci_status < 300:
             earned = _to_int(inner.get("earned"))
             balance = inner.get("points", points)
             streak = _to_int(inner.get("checkin_streak"))
