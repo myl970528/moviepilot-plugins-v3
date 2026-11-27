@@ -19,6 +19,7 @@ BrowserQL 一次 mutation 完成的动作：
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import threading
 import time
@@ -43,6 +44,7 @@ _API_GAMBLE = "/api/account/checkin/gamble"
 
 _RECORDS_KEY = "hdh_records"
 _RECORDS_LIMIT = 500
+_TOKEN_SLOT_KEY = "hdh_token_slot"   # 上次成功的令牌槽位 {idx, fp}
 
 
 class HdhSignIn(_PluginBase):
@@ -53,7 +55,7 @@ class HdhSignIn(_PluginBase):
     # 插件图标
     plugin_icon = "signin.png"
     # 插件版本
-    plugin_version = "1.3"
+    plugin_version = "1.4"
     # 插件作者
     plugin_author = "sdcsmyl"
     # 作者主页
@@ -86,6 +88,11 @@ class HdhSignIn(_PluginBase):
     _password: str = ""
     _browserless_url: str = _DEFAULT_BROWSERLESS_URL
     _browserless_token: str = ""
+    _browserless_token2: str = ""
+    _browserless_token3: str = ""
+    _browserless_token4: str = ""
+    # 本次实际使用的令牌：令牌轮换时由 _do_sign 指定，_bql 读它
+    _token_used: str = ""
     _lucky_mode: bool = False
     _cron: str = _DEFAULT_CRON
     _retry: int = 2
@@ -101,6 +108,9 @@ class HdhSignIn(_PluginBase):
             url = str(config.get("browserless_url") or "").strip().rstrip("/")
             self._browserless_url = url or _DEFAULT_BROWSERLESS_URL
             self._browserless_token = str(config.get("browserless_token") or "").strip()
+            self._browserless_token2 = str(config.get("browserless_token2") or "").strip()
+            self._browserless_token3 = str(config.get("browserless_token3") or "").strip()
+            self._browserless_token4 = str(config.get("browserless_token4") or "").strip()
             self._lucky_mode = bool(config.get("lucky_mode"))
             self._cron = str(config.get("cron") or _DEFAULT_CRON).strip()
             retry = config.get("retry")
@@ -121,6 +131,9 @@ class HdhSignIn(_PluginBase):
             "password": self._password,
             "browserless_url": self._browserless_url,
             "browserless_token": self._browserless_token,
+            "browserless_token2": self._browserless_token2,
+            "browserless_token3": self._browserless_token3,
+            "browserless_token4": self._browserless_token4,
             "lucky_mode": self._lucky_mode,
             "cron": self._cron,
             "retry": self._retry,
@@ -135,8 +148,41 @@ class HdhSignIn(_PluginBase):
     def _mode_label(self) -> str:
         return "赌狗签" if self._mode == self.SIGN_MODE_GAMBLE else "普通签"
 
+    # ---- 令牌轮换
+    def _all_tokens(self) -> List[str]:
+        """按配置顺序返回去重后的令牌（空值丢弃）。"""
+        out: List[str] = []
+        for tok in (self._browserless_token, self._browserless_token2,
+                    self._browserless_token3, self._browserless_token4):
+            if tok and tok not in out:
+                out.append(tok)
+        return out
+
+    @staticmethod
+    def _token_fp(tok: str) -> str:
+        return hashlib.md5(str(tok).encode("utf-8")).hexdigest()[:8]
+
+    def _saved_slot(self, tokens: List[str]) -> int:
+        """上次成功的令牌槽位；若配置已变（令牌被换掉）则回到第一个。"""
+        try:
+            saved = self.get_data(_TOKEN_SLOT_KEY) or {}
+            idx = int(saved.get("idx", -1))
+            fp = str(saved.get("fp") or "")
+            if 0 <= idx < len(tokens) and self._token_fp(tokens[idx]) == fp:
+                return idx
+        except Exception:  # noqa: BLE001
+            pass
+        return 0
+
+    def _save_slot(self, tokens: List[str], idx: int) -> None:
+        try:
+            self.save_data(_TOKEN_SLOT_KEY,
+                           {"idx": idx, "fp": self._token_fp(tokens[idx])})
+        except Exception:  # noqa: BLE001
+            pass
+
     def get_state(self) -> bool:
-        return bool(self._enabled and self._username and self._browserless_token)
+        return bool(self._enabled and self._username and self._all_tokens())
 
     def stop_service(self) -> None:
         pass
@@ -180,7 +226,7 @@ class HdhSignIn(_PluginBase):
         """定时 / 手动签到入口，带失败重试。"""
         if not self._username or not self._password:
             return self._fail("未配置账号或密码")
-        if not self._browserless_token:
+        if not self._all_tokens():
             return self._fail("未配置 Browserless 令牌")
 
         logger.info(f"栖影签到开始，模式：{self._mode_label}")
@@ -224,9 +270,44 @@ class HdhSignIn(_PluginBase):
         return False, msg
 
     def _do_sign(self) -> Dict[str, Any]:
-        """执行一次签到，返回统一结构的结果字典。"""
+        """执行一次签到；令牌额度用尽或鉴权失败时自动换下一个令牌。
+
+        Browserless 免费额度按账号计，一个令牌一个月只有 1000 units，
+        签到一次约 13–16 units，配几个令牌轮换才能长期不断签。优先从上
+        次成功的那个令牌开始，避免每天先撞一次 401。
+        """
         today = datetime.now().strftime("%Y-%m-%d")
         now_time = datetime.now().strftime("%H:%M:%S")
+        tokens = self._all_tokens()
+        if not tokens:
+            return {"ok": False, "msg": "未配置 Browserless 令牌",
+                    "date": today, "time": now_time, "mode": self._mode}
+
+        start = self._saved_slot(tokens)
+        last: Dict[str, Any] = {}
+        for step in range(len(tokens)):
+            idx = (start + step) % len(tokens)
+            self._token_used = tokens[idx]
+            if len(tokens) > 1:
+                logger.info(f"栖影签到：使用令牌 {idx + 1}/{len(tokens)}")
+            result = self._do_sign_once(today, now_time)
+            if result.get("ok"):
+                self._save_slot(tokens, idx)
+                return result
+            last = result
+            msg = str(result.get("msg") or "")
+            # 只有「令牌本身不可用」才值得换；账号密码错、CF 没解过、
+            # 站点报错这类换令牌一样失败。
+            if not _token_fault(msg):
+                return result
+            if step < len(tokens) - 1:
+                logger.warning(f"栖影签到：令牌 {idx + 1}/{len(tokens)} 不可用"
+                               f"（{msg[:80]}），换下一个令牌")
+        return last or {"ok": False, "msg": "所有 Browserless 令牌均不可用",
+                        "date": today, "time": now_time, "mode": self._mode}
+
+    def _do_sign_once(self, today: str, now_time: str) -> Dict[str, Any]:
+        """用当前选定的令牌跑一次完整签到，返回统一结构的结果字典。"""
         mode = self._mode
 
         result = self._bql(self._build_query())
@@ -377,7 +458,7 @@ class HdhSignIn(_PluginBase):
     def _bql(self, query: str) -> Dict[str, Any]:
         endpoint = _bql_endpoint(self._browserless_url)
         separator = "&" if "?" in endpoint else "?"
-        url = f"{endpoint}{separator}token={self._browserless_token}"
+        url = f"{endpoint}{separator}token={self._token_used or self._browserless_token}"
         try:
             resp = requests.post(url, json={"query": query},
                                  headers={"Content-Type": "application/json"},
@@ -686,6 +767,19 @@ def _bql_endpoint(address: str) -> str:
     if base.endswith("/stealth"):
         return base + "/bql"
     return base + "/stealth/bql"
+
+
+def _token_fault(msg: str) -> bool:
+    """失败是否属于「令牌本身不可用」——额度耗尽、鉴权失败、限流。
+
+    这类错误换一个令牌就有机会成功；账号密码错、CF 未过、站点报错换令牌
+    一样失败，不该浪费另一个账号的额度去试。
+    """
+    text = str(msg or "")
+    if "Browserless" not in text:
+        return False
+    return any(k in text for k in ("units usage limit", "401", "429",
+                                   "鉴权失败", "Unauthorized", "Too Many Requests"))
 
 
 def _split_response(raw: str) -> Tuple[int, Any]:
